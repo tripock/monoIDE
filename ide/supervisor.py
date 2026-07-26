@@ -15,7 +15,7 @@ owns its whole lifecycle:
 1. locate the vendored checkout (also inside a PyInstaller bundle),
 2. copy it to a writable state dir when frozen,
 3. mirror the Notion account saved by `ide.auth` into accounts.json + .env,
-4. make sure fastapi/uvicorn exist (dedicated venv when they do not),
+4. make sure fastapi/uvicorn exist (see `ide.deps`, which owns that venv),
 5. start `uvicorn app.server:app` on a free local port,
 6. poll /v1/models until it answers, then hand the base url to the IDE,
 7. keep a ring buffer of its stdout for the UI, and shut it down cleanly.
@@ -37,9 +37,13 @@ import urllib.error
 import urllib.request
 from collections import deque
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Callable, Deque, Dict, List, Optional
 
-LOG_LINES = 400
+from .deps import DependencyError, DepsInstaller, state_dir  # noqa: F401 - state_dir re-exported
+
+# The whole log ends up in the boot diagnostic report, so it must not be a
+# 40-line peephole any more. ~4000 lines is well under a megabyte.
+LOG_LINES = 4000
 BOOT_TIMEOUT = 90.0
 
 
@@ -48,17 +52,6 @@ def _bundle_root() -> Path:
     if bundled:
         return Path(bundled)
     return Path(__file__).resolve().parent.parent
-
-
-def state_dir() -> Path:
-    """Writable per-user directory for the embedded services."""
-    if os.name == "nt":
-        base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
-    else:
-        base = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
-    path = base / "monoide"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
 
 
 def find_vendored() -> Optional[Path]:
@@ -102,6 +95,8 @@ class Notion2ApiService:
         api_key: str = "",
         app_mode: str = "standard",
         source: Optional[Path] = None,
+        emit: Optional[Callable[[str, str], None]] = None,
+        deps_emit: Optional[Callable[[str, str], None]] = None,
     ) -> None:
         self.source = source or find_vendored()
         self.requested_port = port
@@ -113,6 +108,15 @@ class Notion2ApiService:
         self.logs: Deque[str] = deque(maxlen=LOG_LINES)
         self.state = "stopped"  # stopped | starting | ready | failed | external
         self.error = ""
+        self.command: List[str] = []      # kept for the diagnostic report
+        self.exit_code: Optional[int] = None
+        # which step of start() blew up: "deps" | "preflight" | "" - lets the boot
+        # sequence blame the dependency component instead of notion2api
+        self.failed_stage = ""
+        self.deps: Optional[DepsInstaller] = None
+        self._emit = emit
+        # pip progress belongs to the "dependencies" step, not to notion2api itself
+        self._deps_emit = deps_emit or emit
         self._lock = threading.Lock()
         self._reader: Optional[threading.Thread] = None
 
@@ -131,6 +135,25 @@ class Notion2ApiService:
             "error": self.error,
             "detail": self.failure_detail() if self.error else "",
             "log": list(self.logs)[-40:],
+            "log_lines": len(self.logs),
+        }
+
+    def diagnostics(self) -> Dict[str, Any]:
+        """Everything about this service, untruncated, for the boot report."""
+        return {
+            "state": self.state,
+            "error": self.error,
+            "requested_port": self.requested_port,
+            "port": self.port,
+            "base_url": self.base_url,
+            "embedded": self.source is not None,
+            "source": str(self.source) if self.source else "(missing)",
+            "app_mode": self.app_mode,
+            "account": bool(self.account and self.account.get("token_v2")),
+            "pid": self.process.pid if self.process and self.process.poll() is None else 0,
+            "exit_code": self.exit_code,
+            "command": " ".join(self.command) if self.command else "(never spawned)",
+            "log": list(self.logs),
         }
 
     def failure_detail(self) -> str:
@@ -143,8 +166,21 @@ class Notion2ApiService:
     def log(self, line: str) -> None:
         stamped = time.strftime("%H:%M:%S ") + line.rstrip()
         self.logs.append(stamped)
+        if self._emit is not None:
+            try:
+                self._emit("log", line.rstrip())
+            except Exception:  # noqa: BLE001 - a broken listener must not stop the service
+                pass
         if os.environ.get("MONOIDE_VERBOSE"):
             print("[n2a] " + stamped, flush=True)
+
+    def phase(self, text: str) -> None:
+        """A short status for the launcher, e.g. "installing dependencies"."""
+        if self._emit is not None:
+            try:
+                self._emit("phase", text)
+            except Exception:  # noqa: BLE001
+                pass
 
     # -- workspace ---------------------------------------------------------
     def _runtime_dir(self) -> Path:
@@ -191,63 +227,22 @@ class Notion2ApiService:
     def _python_for_service(self, runtime: Path) -> List[str]:
         """An interpreter that can import fastapi + uvicorn.
 
-        Order: current interpreter -> existing managed venv -> new managed venv.
-        A frozen exe has no usable interpreter, so a system python is located.
+        The work lives in `ide.deps`: it verifies the imports on every launch,
+        rebuilds a broken venv, and streams pip's output through `emit` so the
+        launcher can show progress instead of freezing for a minute.
         """
-        probe = "import fastapi, uvicorn, cloudscraper, dotenv"
+        self.deps = DepsInstaller(runtime, emit=self._deps_emit, before_rebuild=self.stop)
+        return self.deps.ensure()
 
-        def ok(cmd: List[str]) -> bool:
-            try:
-                done = subprocess.run(
-                    cmd + ["-c", probe],
-                    capture_output=True, text=True, timeout=60,
-                )
-                return done.returncode == 0
-            except Exception:
-                return False
+    def ensure_dependencies(self) -> List[str]:
+        """Install/verify the dependencies without launching anything.
 
-        candidates: List[List[str]] = []
-        if not getattr(sys, "frozen", False):
-            candidates.append([sys.executable])
-
-        venv = state_dir() / "n2a-venv"
-        venv_python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-        if venv_python.is_file():
-            candidates.append([str(venv_python)])
-
-        for candidate in candidates:
-            if ok(candidate):
-                return candidate
-
-        # Need to build the venv: find any host python.
-        host: List[str] = []
-        if not getattr(sys, "frozen", False):
-            host = [sys.executable]
-        else:
-            for name in ("python", "python3", "py"):
-                found = shutil.which(name)
-                if found:
-                    host = [found, "-3"] if name == "py" else [found]
-                    break
-        if not host:
-            raise RuntimeError(
-                "python 3.9+ is required to run the embedded notion2api - install it from python.org"
-            )
-
-        self.log("creating dependency venv in %s (one time, ~30s)" % venv)
-        subprocess.run(host + ["-m", "venv", str(venv)], check=True, capture_output=True, text=True)
-        pip = [str(venv_python), "-m", "pip", "install", "--disable-pip-version-check", "-q"]
-        subprocess.run(pip + ["--upgrade", "pip"], capture_output=True, text=True)
-        requirements = runtime / "requirements.txt"
-        install = pip + (["-r", str(requirements)] if requirements.is_file() else [
-            "fastapi", "uvicorn[standard]", "requests", "cloudscraper",
-            "python-dotenv", "pydantic", "slowapi", "httpx", "websocket-client",
-        ])
-        done = subprocess.run(install, capture_output=True, text=True)
-        if done.returncode != 0:
-            raise RuntimeError("pip install failed: " + (done.stderr or done.stdout)[-600:])
-        self.log("dependencies installed")
-        return [str(venv_python)]
+        The boot sequence calls this on its own so the packages are in place even
+        when notion2api itself cannot be started yet (no Notion account attached).
+        """
+        if self.source is None:
+            raise DependencyError("vendor/notion2api is missing from this build")
+        return self._python_for_service(self._runtime_dir())
 
     def _preflight(self, python: List[str], runtime: Path) -> None:
         """Import notion2api once, synchronously, to surface the real error.
@@ -305,12 +300,23 @@ class Notion2ApiService:
 
             self.state = "starting"
             self.error = ""
+            self.failed_stage = ""
             try:
+                self.phase("preparing notion2api")
                 runtime = self._runtime_dir()
                 self.port = free_port(self.requested_port)
                 self.write_credentials(runtime)
+                self.failed_stage = "deps"
                 python = self._python_for_service(runtime)
+                self.failed_stage = "preflight"
+                self.phase("checking that notion2api imports")
                 self._preflight(python, runtime)
+                self.failed_stage = ""
+            except DependencyError as exc:
+                self.state = "failed"
+                self.error = str(exc)
+                self.log("startup aborted: %s" % exc)
+                return self.status()
             except Exception as exc:  # noqa: BLE001
                 self.state = "failed"
                 self.error = str(exc)
@@ -346,6 +352,9 @@ class Notion2ApiService:
             creationflags = 0
             if os.name == "nt":
                 creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            self.command = list(command)
+            self.exit_code = None
+            self.phase("starting notion2api on port %d" % self.port)
             self.log("starting notion2api on port %d" % self.port)
             try:
                 self.process = subprocess.Popen(
@@ -388,6 +397,7 @@ class Notion2ApiService:
             code = process.poll()
         except Exception:  # noqa: BLE001
             code = None
+        self.exit_code = code
         if self.state != "stopped":
             self.state = "failed"
             self.error = self.error or "notion2api exited with code %s" % code
@@ -407,6 +417,7 @@ class Notion2ApiService:
 
     def wait_ready(self, timeout: float = BOOT_TIMEOUT) -> Dict[str, Any]:
         deadline = time.time() + timeout
+        self.phase("waiting for notion2api to answer")
         while time.time() < deadline:
             if self.process and self.process.poll() is not None:
                 self.state = "failed"

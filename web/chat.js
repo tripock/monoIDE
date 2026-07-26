@@ -90,7 +90,16 @@
 		}
 		if (!response.ok || !response.body) {
 			const detail = await response.text().catch(() => "");
-			this.el("notice", "HTTP " + response.status + " " + esc(detail.slice(0, 300)));
+			// The server answers 409/503 with a startup report while notion2api is
+			// still coming up; show the reason, not the whole json blob.
+			let message = detail.slice(0, 300);
+			try {
+				const body = JSON.parse(detail);
+				if (body.error) message = body.error + (body.hint ? " - " + body.hint : "");
+			} catch (err) {
+				/* not json: keep the raw text */
+			}
+			this.el("notice", "HTTP " + response.status + " " + esc(message));
 			this.setBusy(false);
 			return;
 		}

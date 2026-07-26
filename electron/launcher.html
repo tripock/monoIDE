@@ -22,13 +22,22 @@
 			</section>
 
 			<section id="boot" hidden>
-				<div class="steps">
-					<div class="step" data-step="folder">project folder</div>
-					<div class="step" data-step="backend">python backend</div>
-					<div class="step" data-step="api">notion2api</div>
-					<div class="step" data-step="ui">editor</div>
-				</div>
+				<div class="steps" id="steps"></div>
 				<pre id="log"></pre>
+			</section>
+
+			<section id="failure" hidden>
+				<h2>startup failed</h2>
+				<p class="sub" id="failure-summary"></p>
+				<ul id="failure-list"></ul>
+				<p class="sub" id="failure-path"></p>
+				<pre id="report"></pre>
+				<div class="actions">
+					<button id="retry">Retry</button>
+					<button id="open-log">Open log file</button>
+					<button id="copy-report">Copy report</button>
+					<button id="back">Choose another folder</button>
+				</div>
 			</section>
 
 			<p id="error" hidden></p>

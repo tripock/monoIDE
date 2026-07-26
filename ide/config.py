@@ -64,6 +64,17 @@ DEFAULTS: Dict[str, Any] = {
         # name -> {"cmd": [...], "env": {...}, "enabled": true}
         "servers": {}
     },
+    "boot": {
+        # a failure in any of these stops the app from opening at all
+        "required": ["workspace", "runtime", "deps", "notion2api"],
+        # these are reported and never block: a missing language server is normal,
+        # and "not signed in to Notion yet" is the expected state on a first run
+        "advisory": ["account", "lsp", "mcp", "terminal"],
+        # set to false to fall back to "open the editor anyway", e.g. offline
+        "block_on_failure": True,
+        # let the app install the notion2api dependencies by itself
+        "deps_install": True,
+    },
     "auth": {
         # a Notion account must be attached before the agent will answer
         "require_login": True,

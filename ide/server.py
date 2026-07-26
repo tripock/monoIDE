@@ -22,7 +22,9 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from .agent import Session, Upstream
 from .auth import AuthStore, LoginFlow, available_browsers, extract_candidates, validate
+from .boot import BootMonitor
 from .config import Config
+from .deps import describe as describe_deps
 from .lsp import LspManager
 from .mcp import McpManager
 from .supervisor import Notion2ApiService, find_vendored
@@ -58,20 +60,31 @@ class Workspace:
         self.sessions: Dict[str, Session] = {}
         self.started = time.time()
         self.n2a: Optional[Notion2ApiService] = None
+        self.upstream_skipped = ""   # why notion2api was not started at all
+        self.boot = BootMonitor(
+            required=self.config.get("boot", "required", default=None),
+            advisory=self.config.get("boot", "advisory", default=None),
+            block_on_failure=bool(self.config.get("boot", "block_on_failure", default=True)),
+        )
+        self._boot_thread: Optional[threading.Thread] = None
 
     # -- embedded notion2api ----------------------------------------------
-    def start_upstream(self) -> None:
-        """Boot the bundled notion2api and point the upstream config at it.
+    def prepare_upstream(self) -> Optional[Notion2ApiService]:
+        """Construct the service. Cheap: no subprocess, no network.
 
-        Skipped when the user explicitly configured an external instance
-        (MONOIDE_BASE_URL / --base-url / upstream.embedded = false).
+        Returns None when the user runs their own notion2api
+        (MONOIDE_BASE_URL / --base-url / --no-embedded-api / upstream.embedded=false)
+        or when the build shipped without it.
         """
+        self.upstream_skipped = ""
         if not self.config.get("upstream", "embedded", default=True):
-            return
-        if os.environ.get("MONOIDE_EXTERNAL_UPSTREAM") == "1":
-            return
-        if find_vendored() is None:
-            return
+            self.upstream_skipped = "using the external notion2api from the config"
+        elif os.environ.get("MONOIDE_EXTERNAL_UPSTREAM") == "1":
+            self.upstream_skipped = "using an external notion2api (--base-url / --no-embedded-api)"
+        elif find_vendored() is None:
+            self.upstream_skipped = "vendor/notion2api is not part of this build"
+        if self.upstream_skipped:
+            return None
         self.n2a = Notion2ApiService(
             account=self.auth.account,
             port=int(
@@ -81,30 +94,63 @@ class Workspace:
             ),
             api_key=str(self.config.get("upstream", "api_key", default="") or ""),
             app_mode=str(self.config.get("upstream", "app_mode", default="standard") or "standard"),
+            emit=self.boot.emit_for("notion2api"),
+            deps_emit=self.boot.emit_for("deps"),
         )
-        status = self.n2a.start()
-        if status.get("state") in ("ready", "external"):
-            self.config.set(["upstream", "base_url"], status["base_url"])
-            print("[ide] notion2api: %s (%s)" % (status["base_url"], status["state"]))
-        else:
-            print("[ide] notion2api failed to start: %s"
-                  % (status.get("detail") or status.get("error")))
-            print("[ide] the IDE still works; fix the cause and POST /api/upstream/restart")
+        return self.n2a
 
-    def restart_upstream(self) -> Dict[str, Any]:
-        """Re-launch notion2api, e.g. right after a successful Notion sign-in."""
+    def boot_upstream(self) -> Dict[str, Any]:
+        """Blocking: installs dependencies and launches notion2api."""
         if self.n2a is None:
-            self.start_upstream()
-            return self.n2a.status() if self.n2a else {"state": "disabled"}
-        status = self.n2a.restart(account=self.auth.account)
+            return {"state": "skipped", "error": ""}
+        status = self.n2a.start()
         if status.get("state") in ("ready", "external"):
             self.config.set(["upstream", "base_url"], status["base_url"])
         return status
 
+    def start_upstream(self) -> None:
+        """Synchronous prepare + boot. Kept for the CLI and for restart_upstream."""
+        if self.prepare_upstream() is None:
+            return
+        status = self.boot_upstream()
+        if status.get("state") in ("ready", "external"):
+            print("[ide] notion2api: %s (%s)" % (status["base_url"], status["state"]))
+        else:
+            print("[ide] notion2api failed to start: %s"
+                  % (status.get("detail") or status.get("error")))
+
+    def restart_upstream(self) -> Dict[str, Any]:
+        """Re-launch notion2api, e.g. right after a successful Notion sign-in."""
+        if self.n2a is None:
+            if self.prepare_upstream() is None:
+                return {"state": "skipped", "reason": self.upstream_skipped}
+            status = self.boot_upstream()
+        else:
+            status = self.n2a.restart(account=self.auth.account)
+            if status.get("state") in ("ready", "external"):
+                self.config.set(["upstream", "base_url"], status["base_url"])
+        # Keep /api/boot honest: signing in is what unblocks notion2api, so the
+        # startup view must reflect the result of this restart.
+        account = (self.auth.account or {}).get("token_v2")
+        if account:
+            self.boot.finish("account", True, detail=(self.auth.account or {}).get("user_email")
+                             or "attached")
+        if status.get("state") in ("ready", "external"):
+            self.boot.finish("notion2api", True,
+                             detail="%s (%s)" % (status.get("base_url", ""), status["state"]))
+        elif account:
+            self.boot.finish("notion2api", False,
+                             status.get("error") or "notion2api did not start")
+        return status
+
     def upstream_status(self) -> Dict[str, Any]:
         if self.n2a is None:
+            # Deliberately not "external": during an async boot that would read
+            # as a success before anything has actually been tried.
+            state = "skipped" if self.upstream_skipped else "starting"
             return {
-                "state": "external",
+                "state": state,
+                "reason": self.upstream_skipped,
                 "embedded": find_vendored() is not None,
                 "base_url": str(self.config.get("upstream", "base_url", default="")),
                 "port": 0,
@@ -112,7 +158,231 @@ class Workspace:
                 "error": "",
                 "log": [],
             }
-        return self.n2a.status()
+        status = self.n2a.status()
+        status["boot_state"] = self.boot.components["notion2api"].state
+        return status
+
+    # -- startup sequence --------------------------------------------------
+    def boot_sequence(self) -> None:
+        """Bring every component up, in order, recording what happened.
+
+        Runs on a background thread so the HTTP server can answer immediately;
+        a first launch spends a minute or two here installing python packages.
+        """
+        boot = self.boot
+        try:
+            boot.begin("workspace", "checking the project folder")
+            self._check_workspace()
+
+            boot.begin("runtime", "looking for a python runtime")
+            self._check_runtime()
+
+            if boot.components["runtime"].state == "failed":
+                boot.skip("deps", "no python runtime")
+                boot.skip("notion2api", "no python runtime")
+            else:
+                self._boot_upstream_step()
+
+            self._check_advisory()
+        except Exception as exc:  # noqa: BLE001 - the boot thread must always finish
+            boot.log("boot sequence crashed: %s: %s" % (type(exc).__name__, exc))
+            for component in boot.components.values():
+                if component.state in ("pending", "active"):
+                    boot.finish(component.key, False, "%s: %s" % (type(exc).__name__, exc))
+        finally:
+            self._collect_context()
+            boot.write_report()
+            boot.complete()
+            self._announce()
+
+    def _check_workspace(self) -> None:
+        boot = self.boot
+        if not self.root.is_dir():
+            return boot.finish("workspace", False, "%s is not a directory" % self.root)
+        probe = self.root / ".monoide"
+        try:
+            probe.mkdir(parents=True, exist_ok=True)
+            marker = probe / ".write-probe"
+            marker.write_text("ok", encoding="utf-8")
+            marker.unlink()
+        except OSError as exc:
+            return boot.finish(
+                "workspace", False, "cannot write to %s: %s" % (probe, exc),
+                hint="Choose a folder you can write to, or fix its permissions.",
+            )
+        boot.finish("workspace", True, detail=str(self.root))
+
+    def _check_runtime(self) -> None:
+        from .deps import MIN_PYTHON, host_python, python_version
+
+        boot = self.boot
+        host = host_python()
+        if host:
+            return boot.finish("runtime", True, detail=python_version(host) or " ".join(host))
+        # An external notion2api needs no interpreter of ours, so this is only
+        # fatal when we are the ones who have to run it.
+        if not self.config.get("upstream", "embedded", default=True) \
+                or os.environ.get("MONOIDE_EXTERNAL_UPSTREAM") == "1" \
+                or find_vendored() is None:
+            return boot.skip("runtime", "not needed for an external notion2api")
+        boot.finish(
+            "runtime", False,
+            "no usable python %d.%d+ was found on PATH" % MIN_PYTHON,
+        )
+
+    def _boot_upstream_step(self) -> None:
+        from .deps import DependencyError  # noqa: PLC0415
+
+        boot = self.boot
+        if self.prepare_upstream() is None:
+            boot.skip("deps", self.upstream_skipped)
+            boot.skip("account", self.upstream_skipped)
+            boot.skip("notion2api", self.upstream_skipped)
+            return
+
+        service = self.n2a
+        assert service is not None
+
+        # Dependencies first, and on their own: they are worth installing even
+        # when notion2api cannot be launched yet.
+        boot.begin("deps", "checking python dependencies")
+        try:
+            service.ensure_dependencies()
+        except DependencyError as exc:
+            boot.finish("deps", False, str(exc))
+            boot.skip("account", "dependencies unavailable")
+            boot.skip("notion2api", "dependencies unavailable")
+            return
+        except Exception as exc:  # noqa: BLE001
+            boot.finish("deps", False, "%s: %s" % (type(exc).__name__, exc))
+            boot.skip("account", "dependencies unavailable")
+            boot.skip("notion2api", "dependencies unavailable")
+            return
+        packages = len(service.deps.packages) if service.deps else 0
+        boot.finish("deps", True, detail=("%d packages" % packages) if packages else "ready")
+
+        # notion2api reads its accounts at *import* time
+        # (vendor/notion2api/app/config.py raises ValueError when there are none),
+        # so before the first Notion sign-in it cannot start at all. That is a
+        # first-run state, not a broken install: the sign-in lives inside the
+        # editor, so blocking here would lock the user out for good.
+        boot.begin("account")
+        if not (self.auth.account or {}).get("token_v2"):
+            boot.finish(
+                "account", False, "no Notion account attached yet",
+                hint="Open the editor and sign in to Notion. notion2api starts "
+                     "automatically as soon as the account is attached.",
+            )
+            boot.skip("notion2api", "waiting for the Notion sign-in")
+            return
+        boot.finish("account", True, detail=self.auth.account.get("user_email")
+                    or self.auth.account.get("profile_name") or "attached")
+
+        boot.begin("notion2api", "starting notion2api")
+        status = self.boot_upstream()
+        if status.get("state") in ("ready", "external"):
+            boot.finish("notion2api", True, detail="%s (%s)" % (status["base_url"], status["state"]))
+        else:
+            boot.finish("notion2api", False, status.get("error") or "notion2api did not start")
+
+    def _check_advisory(self) -> None:
+        """Optional tooling. Reported, never blocking."""
+        boot = self.boot
+        try:
+            rows = self.lsp.status()
+            installed = [row for row in rows if row.get("installed")]
+            boot.begin("lsp")
+            if not rows:
+                boot.skip("lsp", "no language servers configured")
+            elif not installed:
+                boot.finish("lsp", False,
+                            "none of %d configured language servers are installed" % len(rows),
+                            hint="Optional. Install e.g. pyright-langserver to get "
+                                 "diagnostics; the editor works without it.")
+            else:
+                boot.finish("lsp", True,
+                            detail="%d of %d installed" % (len(installed), len(rows)))
+        except Exception as exc:  # noqa: BLE001
+            boot.finish("lsp", False, str(exc))
+
+        try:
+            rows = self.mcp.status()
+            boot.begin("mcp")
+            if not rows:
+                boot.skip("mcp", "no servers configured")
+            else:
+                boot.finish("mcp", True, detail="%d configured" % len(rows))
+        except Exception as exc:  # noqa: BLE001
+            boot.finish("mcp", False, str(exc))
+
+        boot.begin("terminal")
+        try:
+            boot.finish("terminal", True, detail=self.terminals.shell or "default shell")
+        except Exception as exc:  # noqa: BLE001
+            boot.finish("terminal", False, str(exc))
+
+    def _collect_context(self) -> None:
+        """Facts the diagnostic report needs but the monitor cannot know."""
+        runtime = find_vendored()
+        self.boot.context = {
+            "paths": {
+                "workspace": str(self.root),
+                "config": str(self.root / ".monoide" / "config.json"),
+                "notion2api source": str(runtime) if runtime else "(missing)",
+            },
+            "deps": describe_deps(runtime) if runtime else {},
+            "upstream": self.n2a.diagnostics() if self.n2a else {
+                "state": "skipped", "reason": self.upstream_skipped, "log": [],
+            },
+        }
+        if self.n2a is not None and self.n2a.deps is not None:
+            self.boot.context["deps"].update({
+                "reinstall_reason": self.n2a.deps.reinstall_reason,
+                "probe_error": self.n2a.deps.probe_error,
+                "commands": self.n2a.deps.commands,
+                "packages": self.n2a.deps.packages,
+            })
+
+    def _announce(self) -> None:
+        boot = self.boot
+        if boot.blocked:
+            print("[ide] startup failed - the editor will not open")
+            for component in boot.failures:
+                print("[ide]   x %s: %s" % (component.label, component.error))
+                if component.hint:
+                    print("[ide]     -> %s" % component.hint)
+            if boot.report_path:
+                print("[ide] full diagnostic: %s" % boot.report_path)
+            return
+        for component in boot.warnings:
+            print("[ide]   ! %s: %s" % (component.label, component.error))
+        upstream = boot.components["notion2api"]
+        if upstream.state == "ok":
+            print("[ide] notion2api: %s" % upstream.detail)
+        print("[ide] ready in %.1fs" % (time.time() - boot.started))
+
+    def start_boot(self, on_finish: Optional[Any] = None) -> None:
+        """Kick the sequence off on a background thread. Reused by /api/boot/retry."""
+        if self._boot_thread is not None and self._boot_thread.is_alive():
+            return
+
+        def run() -> None:
+            self.boot_sequence()
+            if on_finish is not None:
+                on_finish()
+
+        self._boot_thread = threading.Thread(target=run, daemon=True)
+        self._boot_thread.start()
+
+    def retry_boot(self) -> Dict[str, Any]:
+        if self._boot_thread is not None and self._boot_thread.is_alive():
+            return self.boot.snapshot()
+        if self.n2a is not None:
+            self.n2a.stop()
+            self.n2a = None
+        self.boot.reset()
+        self.start_boot()
+        return self.boot.snapshot()
 
     # -- auth gate ---------------------------------------------------------
     @property
@@ -350,6 +620,43 @@ class Handler(BaseHTTPRequestHandler):
                 "mtime": path.stat().st_mtime,
             })
 
+        if route == "/api/boot":
+            return self._json(workspace.boot.snapshot())
+
+        if route == "/api/boot/stream":
+            boot = workspace.boot
+            channel = boot.subscribe()
+            try:
+                self._sse_open()
+                if not self._sse_send("snapshot", boot.snapshot()):
+                    return None
+                while True:
+                    try:
+                        event = channel.get(timeout=10)
+                    except queue.Empty:
+                        if boot.finished:
+                            break
+                        if not self._sse_send("ping", {}):
+                            return None
+                        continue
+                    kind = str(event.pop("type", "log"))
+                    if not self._sse_send(kind, event):
+                        return None
+                    if kind == "done":
+                        break
+                self._sse_send("end", boot.snapshot())
+            finally:
+                # Without this a launcher reload leaks a queue on every boot.
+                boot.unsubscribe(channel)
+            return None
+
+        if route == "/api/boot/report":
+            text = workspace.boot.report()
+            if first("format") == "text":
+                return self._send(200, text.encode("utf-8", "replace"),
+                                  "text/plain; charset=utf-8")
+            return self._json({"path": workspace.boot.report_path, "text": text})
+
         if route == "/api/upstream/status":
             return self._json(workspace.upstream_status())
 
@@ -524,6 +831,9 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True, "flow": manual.id, "candidates": manual._safe_candidates(),
             })
 
+        if route == "/api/boot/retry":
+            return self._json(workspace.retry_boot())
+
         if route == "/api/upstream/restart":
             return self._json(workspace.restart_upstream())
 
@@ -552,6 +862,21 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"ok": True, "locked": workspace.login_required})
 
         if route == "/api/chat":
+            # notion2api now boots in the background, so a message sent during
+            # startup would otherwise hit the stale default base_url and fail
+            # with a raw connection error.
+            upstream = workspace.boot.components["notion2api"]
+            if upstream.state in ("pending", "active"):
+                return self._json(
+                    {"error": "notion2api is still starting", "boot": workspace.boot.snapshot(20)},
+                    409,
+                )
+            if upstream.state == "failed":
+                return self._json(
+                    {"error": "notion2api did not start: " + upstream.error,
+                     "hint": upstream.hint, "boot": workspace.boot.snapshot(20)},
+                    503,
+                )
             if workspace.login_required:
                 return self._error("sign in to Notion first", 401)
             return self._chat(body)
@@ -662,9 +987,14 @@ def _metrics(workspace: Workspace) -> Dict[str, Any]:
     }
 
 
-def serve(root: str, host: str = "127.0.0.1", port: int = 4321) -> None:
+def serve(root: str, host: str = "127.0.0.1", port: int = 4321) -> int:
+    """Run the IDE. Returns the process exit code.
+
+    The socket is bound *before* anything slow happens, so /api/state answers in
+    milliseconds and the launcher can watch the dependency install through
+    /api/boot/stream instead of staring at a frozen window.
+    """
     workspace = Workspace(Path(root).resolve())
-    workspace.start_upstream()
     handler = type("BoundHandler", (Handler,), {"workspace": workspace})
     httpd = ThreadingHTTPServer((host, port), handler)
     httpd.daemon_threads = True
@@ -672,6 +1002,18 @@ def serve(root: str, host: str = "127.0.0.1", port: int = 4321) -> None:
     print("[ide] listening : http://%s:%d" % (host, port))
     print(f"[ide] upstream  : {workspace.config.get('upstream', 'base_url')} "
           f"model={workspace.config.get('upstream', 'model')}")
+
+    # Under the desktop shell the process must stay alive after a failed boot:
+    # the launcher still has to fetch /api/boot/report to show the diagnosis.
+    interactive = os.environ.get("MONOIDE_SHELL") != "electron"
+
+    def gate() -> None:
+        if interactive and workspace.boot.blocked:
+            print("[ide] refusing to serve a broken setup - shutting down")
+            threading.Thread(target=httpd.shutdown, daemon=True).start()
+
+    workspace.start_boot(on_finish=gate)
+
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -679,3 +1021,4 @@ def serve(root: str, host: str = "127.0.0.1", port: int = 4321) -> None:
     finally:
         workspace.shutdown()
         httpd.server_close()
+    return 2 if (interactive and workspace.boot.blocked) else 0

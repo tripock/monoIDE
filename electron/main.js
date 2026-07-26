@@ -8,7 +8,7 @@
 //
 // No terminal, no "open this url in a browser" step, no cli argument.
 
-const { app, BrowserWindow, dialog, ipcMain, shell, Menu } = require("electron")
+const { app, BrowserWindow, clipboard, dialog, ipcMain, shell, Menu } = require("electron")
 const { spawn, spawnSync } = require("child_process")
 const fs = require("fs")
 const http = require("http")
@@ -23,6 +23,9 @@ let win = null
 let backend = null
 let backendPort = 0
 let backendLog = []
+let prewarm = null
+let prewarmState = { state: "pending", phase: "" }
+let bootRequest = null
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -103,7 +106,119 @@ function resolveBackend() {
 	throw new Error("Python 3.9+ was not found in PATH - install it from python.org")
 }
 
-function waitForBackend(port, timeoutMs = 120000) {
+// Install the python dependencies while the user is still choosing a folder.
+// Failures here are not fatal: the backend runs the same check again and is the
+// one that produces the diagnostic report.
+function startPrewarm() {
+	let command
+	let args
+	try {
+		;({ command, args } = resolveBackend())
+	} catch (error) {
+		prewarmState = { state: "failed", phase: String(error.message || error) }
+		return
+	}
+	prewarmState = { state: "running", phase: "checking python dependencies" }
+	try {
+		prewarm = spawn(command, [...args, "--prewarm"], {
+			cwd: PROJECT_ROOT,
+			env: { ...process.env, PYTHONUNBUFFERED: "1", PYTHONIOENCODING: "utf-8" },
+			windowsHide: true,
+		})
+	} catch (error) {
+		prewarmState = { state: "failed", phase: String(error.message || error) }
+		return
+	}
+	let pending = ""
+	let spoke = false // did it ever answer in our JSON protocol?
+	prewarm.stdout.on("data", (chunk) => {
+		pending += String(chunk)
+		const rows = pending.split(/\r?\n/)
+		pending = rows.pop() || ""
+		for (const row of rows) {
+			if (!row.trim()) continue
+			let event
+			try {
+				event = JSON.parse(row)
+			} catch {
+				continue // a stray print from the interpreter, not our protocol
+			}
+			spoke = true
+			if (event.phase) prewarmState.phase = event.phase
+			if (event.state) prewarmState.state = event.state
+			send("prewarm-progress", { ...event, ...prewarmState })
+		}
+	})
+	prewarm.stderr.on("data", (chunk) => console.log("[prewarm]", String(chunk).trim()))
+	prewarm.on("exit", (code) => {
+		if (prewarmState.state === "running") {
+			if (code === 0) {
+				prewarmState = { state: "ready", phase: "dependencies ready" }
+			} else if (!spoke) {
+				// An older dist/monoide.exe does not know --prewarm. Not a problem:
+				// the backend installs the dependencies itself and reports properly.
+				prewarmState = { state: "skipped", phase: "installed with the backend" }
+			} else {
+				prewarmState = { state: "failed", phase: `prewarm exited with code ${code}` }
+			}
+		}
+		prewarm = null
+		send("prewarm-progress", { t: "deps", ...prewarmState })
+	})
+}
+
+function send(channel, payload) {
+	if (win && !win.isDestroyed()) win.webContents.send(channel, payload)
+}
+
+// Relay GET /api/boot/stream to the renderer. Done here rather than with an
+// EventSource in the page so launcher.html keeps its `default-src 'none'` CSP.
+function subscribeBoot(port) {
+	if (bootRequest) {
+		bootRequest.destroy()
+		bootRequest = null
+	}
+	let buffer = ""
+	const request = http.get(
+		{ host: "127.0.0.1", port, path: "/api/boot/stream" },
+		(response) => {
+			response.setEncoding("utf8")
+			response.on("data", (chunk) => {
+				buffer += chunk
+				let split
+				while ((split = buffer.indexOf("\n\n")) !== -1) {
+					const frame = buffer.slice(0, split)
+					buffer = buffer.slice(split + 2)
+					let type = "message"
+					const data = []
+					for (const line of frame.split("\n")) {
+						if (line.startsWith("event: ")) type = line.slice(7).trim()
+						else if (line.startsWith("data: ")) data.push(line.slice(6))
+					}
+					if (!data.length) continue
+					try {
+						send("boot-event", { type, data: JSON.parse(data.join("\n")) })
+					} catch {
+						/* ignore a malformed frame */
+					}
+				}
+			})
+			response.on("end", () => {
+				bootRequest = null
+			})
+		},
+	)
+	request.on("error", () => {
+		bootRequest = null
+		// Fall back to a single poll so the launcher is never left with nothing.
+		apiGet("/api/boot").then((state) => {
+			if (state) send("boot-event", { type: "snapshot", data: state })
+		})
+	})
+	bootRequest = request
+}
+
+function waitForBackend(port, timeoutMs = 45000) {
 	const deadline = Date.now() + timeoutMs
 	return new Promise((resolve, reject) => {
 		const attempt = () => {
@@ -151,7 +266,42 @@ function apiGet(pathname) {
 	})
 }
 
+function apiPost(pathname, body = {}) {
+	return new Promise((resolve) => {
+		if (!backendPort) return resolve(null)
+		const payload = Buffer.from(JSON.stringify(body), "utf8")
+		const request = http.request(
+			{
+				host: "127.0.0.1",
+				port: backendPort,
+				path: pathname,
+				method: "POST",
+				timeout: 10000,
+				headers: { "Content-Type": "application/json", "Content-Length": payload.length },
+			},
+			(response) => {
+				let raw = ""
+				response.on("data", (chunk) => (raw += chunk))
+				response.on("end", () => {
+					try {
+						resolve(JSON.parse(raw))
+					} catch {
+						resolve(null)
+					}
+				})
+			},
+		)
+		request.on("timeout", () => request.destroy())
+		request.on("error", () => resolve(null))
+		request.end(payload)
+	})
+}
+
 function stopBackend() {
+	if (bootRequest) {
+		bootRequest.destroy()
+		bootRequest = null
+	}
 	if (!backend || backend.exitCode !== null) return
 	try {
 		if (process.platform === "win32") {
@@ -163,6 +313,22 @@ function stopBackend() {
 		/* ignore */
 	}
 	backend = null
+}
+
+function stopAll() {
+	stopBackend()
+	if (prewarm && prewarm.exitCode === null) {
+		try {
+			if (process.platform === "win32") {
+				spawnSync("taskkill", ["/pid", String(prewarm.pid), "/t", "/f"])
+			} else {
+				prewarm.kill("SIGTERM")
+			}
+		} catch {
+			/* ignore */
+		}
+		prewarm = null
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -264,14 +430,13 @@ ipcMain.handle("open-project", async (_event, folder) => {
 
 		await waitForBackend(backendPort)
 		rememberRecent(folder)
-		const upstream = await apiGet("/api/upstream/status")
-		if (upstream && upstream.state === "failed") {
-			log("notion2api: " + (upstream.error || "failed to start"))
-		}
+		// The rest of the boot (dependencies, notion2api) is watched over the
+		// event stream; the launcher decides whether the editor may open.
+		subscribeBoot(backendPort)
 		return {
 			ok: true,
 			url: `http://127.0.0.1:${backendPort}/`,
-			upstream: upstream || null,
+			boot: await apiGet("/api/boot"),
 		}
 	} catch (error) {
 		stopBackend()
@@ -280,13 +445,41 @@ ipcMain.handle("open-project", async (_event, folder) => {
 })
 
 ipcMain.handle("enter-ide", async () => {
-	if (!backendPort) return false
+	if (!backendPort) return { ok: false, error: "the backend is not running" }
+	// Second line of defence: the renderer already refuses to call this while the
+	// boot is blocked, but File -> Open folder can drive the window too.
+	const state = await apiGet("/api/boot")
+	if (state && state.blocked) {
+		return { ok: false, blocked: state.failed || [], boot: state }
+	}
 	await win.loadURL(`http://127.0.0.1:${backendPort}/`)
-	return true
+	return { ok: true }
 })
 
 ipcMain.handle("upstream-status", () => apiGet("/api/upstream/status"))
 ipcMain.handle("backend-log", () => backendLog.slice(-80))
+ipcMain.handle("boot-state", () => apiGet("/api/boot"))
+ipcMain.handle("boot-report", () => apiGet("/api/boot/report"))
+ipcMain.handle("boot-retry", async () => {
+	const state = await apiPost("/api/boot/retry", {})
+	if (state) subscribeBoot(backendPort)
+	return state
+})
+ipcMain.handle("prewarm-state", () => prewarmState)
+ipcMain.handle("copy-text", (_event, text) => {
+	clipboard.writeText(String(text || ""))
+	return true
+})
+ipcMain.handle("open-log-file", async (_event, target) => {
+	const stateDir =
+		process.platform === "win32"
+			? path.join(process.env.LOCALAPPDATA || app.getPath("userData"), "monoide")
+			: path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"), "monoide")
+	const candidate = target || path.join(stateDir, "logs", "boot-last.log")
+	if (!fs.existsSync(candidate)) return false
+	shell.showItemInFolder(candidate)
+	return true
+})
 
 // ---------------------------------------------------------------------------
 // lifecycle
@@ -301,14 +494,17 @@ if (!app.requestSingleInstanceLock()) {
 			win.focus()
 		}
 	})
-	app.whenReady().then(createWindow)
+	app.whenReady().then(() => {
+		createWindow()
+		startPrewarm()
+	})
 	app.on("activate", () => {
 		if (BrowserWindow.getAllWindows().length === 0) createWindow()
 	})
 	app.on("window-all-closed", () => {
-		stopBackend()
+		stopAll()
 		if (process.platform !== "darwin") app.quit()
 	})
-	app.on("before-quit", stopBackend)
-	process.on("exit", stopBackend)
+	app.on("before-quit", stopAll)
+	process.on("exit", stopAll)
 }
