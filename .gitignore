@@ -1,0 +1,39 @@
+# --- build artifacts -------------------------------------------------------
+/dist/
+/build/
+/.build/
+*.spec.bak
+
+# PyInstaller leftovers
+__pycache__/
+*.py[cod]
+*.pyo
+
+# --- electron --------------------------------------------------------------
+electron/node_modules/
+electron/dist/
+electron/out/
+electron/*.log
+npm-debug.log*
+
+# --- python envs -----------------------------------------------------------
+.venv/
+venv/
+env/
+
+# --- IDE runtime state -----------------------------------------------------
+.monoide/
+*.log
+
+# --- notion2api local credentials (never commit these) ---------------------
+vendor/notion2api/.env
+vendor/notion2api/accounts.json
+vendor/notion2api/*.db
+.env
+accounts.json
+
+# --- editors / os ----------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

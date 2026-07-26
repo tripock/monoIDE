@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta
+			http-equiv="Content-Security-Policy"
+			content="default-src 'none'; style-src 'self'; script-src 'self';"
+		/>
+		<title>Mono IDE</title>
+		<link rel="stylesheet" href="launcher.css" />
+	</head>
+	<body>
+		<main>
+			<h1>mono ide</h1>
+			<p class="sub">local editor · notion ai agent · mcp · built-in notion2api</p>
+
+			<button id="pick" class="primary">Choose project folder…</button>
+
+			<section id="recents-box" hidden>
+				<h2>recent</h2>
+				<ul id="recents"></ul>
+			</section>
+
+			<section id="boot" hidden>
+				<div class="steps">
+					<div class="step" data-step="folder">project folder</div>
+					<div class="step" data-step="backend">python backend</div>
+					<div class="step" data-step="api">notion2api</div>
+					<div class="step" data-step="ui">editor</div>
+				</div>
+				<pre id="log"></pre>
+			</section>
+
+			<p id="error" hidden></p>
+		</main>
+		<script src="launcher.js"></script>
+	</body>
+</html>

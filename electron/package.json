@@ -1,0 +1,44 @@
+{
+  "name": "monoide-desktop",
+  "productName": "Mono IDE",
+  "version": "1.0.0",
+  "description": "Desktop shell for Mono IDE: picks a project folder, boots the bundled notion2api + python backend, then renders the editor.",
+  "main": "main.js",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "package": "electron-packager . \"Mono IDE\" --platform=win32 --arch=x64 --out=dist --overwrite --prune=true --extra-resource=../dist/monoide.exe",
+    "dist": "electron-builder --win nsis portable"
+  },
+  "devDependencies": {
+    "@electron/packager": "^18.3.6",
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "dev.monoide.desktop",
+    "productName": "Mono IDE",
+    "files": [
+      "main.js",
+      "preload.js",
+      "launcher.html",
+      "launcher.js",
+      "launcher.css"
+    ],
+    "extraResources": [
+      {
+        "from": "../dist/monoide.exe",
+        "to": "backend/monoide.exe"
+      }
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "signAndEditExecutable": false
+    },
+    "forceCodeSigning": false
+  },
+  "author": "mono ide"
+}

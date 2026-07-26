@@ -1,0 +1,162 @@
+:root {
+	color-scheme: dark;
+	--bg: #0f0f0f;
+	--fg: #e8e8e8;
+	--dim: #8a8a8a;
+	--line: #262626;
+	--ok: #7ec699;
+	--bad: #e2777a;
+}
+
+* {
+	box-sizing: border-box;
+}
+
+body {
+	margin: 0;
+	background: var(--bg);
+	color: var(--fg);
+	font: 13px/1.55 ui-monospace, "SFMono-Regular", Consolas, monospace;
+	display: flex;
+	justify-content: center;
+	padding: 8vh 24px;
+}
+
+main {
+	width: 100%;
+	max-width: 560px;
+}
+
+h1 {
+	margin: 0;
+	font-size: 26px;
+	letter-spacing: 0.14em;
+	text-transform: uppercase;
+}
+
+.sub {
+	margin: 6px 0 28px;
+	color: var(--dim);
+}
+
+h2 {
+	margin: 26px 0 8px;
+	font-size: 11px;
+	letter-spacing: 0.18em;
+	text-transform: uppercase;
+	color: var(--dim);
+}
+
+button {
+	font: inherit;
+	color: var(--fg);
+	background: #171717;
+	border: 1px solid var(--line);
+	border-radius: 8px;
+	padding: 12px 16px;
+	cursor: pointer;
+	width: 100%;
+	text-align: left;
+}
+
+button:hover:not(:disabled) {
+	border-color: #454545;
+	background: #1d1d1d;
+}
+
+button:disabled {
+	opacity: 0.55;
+	cursor: default;
+}
+
+button.primary {
+	background: #ededed;
+	color: #111;
+	border-color: #ededed;
+	text-align: center;
+}
+
+ul {
+	list-style: none;
+	margin: 0;
+	padding: 0;
+	display: grid;
+	gap: 6px;
+}
+
+li button {
+	padding: 9px 12px;
+	color: var(--dim);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+li button strong {
+	color: var(--fg);
+	font-weight: 500;
+}
+
+.steps {
+	display: grid;
+	gap: 4px;
+	margin: 26px 0 14px;
+}
+
+.step {
+	padding: 8px 12px;
+	border: 1px solid var(--line);
+	border-radius: 6px;
+	color: var(--dim);
+}
+
+.step::before {
+	content: "○ ";
+}
+
+.step.active {
+	color: var(--fg);
+}
+
+.step.active::before {
+	content: "▶ ";
+}
+
+.step.done {
+	color: var(--ok);
+	border-color: #26402f;
+}
+
+.step.done::before {
+	content: "● ";
+}
+
+.step.failed {
+	color: var(--bad);
+	border-color: #40262a;
+}
+
+.step.failed::before {
+	content: "× ";
+}
+
+pre {
+	margin: 0;
+	max-height: 30vh;
+	overflow: auto;
+	padding: 10px 12px;
+	border: 1px solid var(--line);
+	border-radius: 6px;
+	color: var(--dim);
+	font-size: 11.5px;
+	white-space: pre-wrap;
+}
+
+#error {
+	margin-top: 18px;
+	padding: 10px 12px;
+	border: 1px solid #40262a;
+	border-radius: 6px;
+	color: var(--bad);
+	white-space: pre-wrap;
+}

@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EDITOR</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<header class="bar top">
+	<div class="brand">
+		<span class="mark"></span><span id="ws-name">WORKSPACE</span>
+	</div>
+	<nav class="nav">
+		<button class="btn ghost" data-panel="files">FILES</button>
+		<button class="btn ghost" data-panel="search">SEARCH</button>
+		<button class="btn ghost" data-panel="tools">TOOLS</button>
+	</nav>
+	<div class="spacer"></div>
+	<div class="selects">
+		<select id="model" class="sel" title="model"></select>
+		<button class="btn ghost" id="btn-settings">CONFIG</button>
+		<button class="btn solid" id="btn-save">SAVE <span class="kbd">S</span></button>
+	</div>
+</header>
+
+<main class="grid">
+
+	<!-- LEFT ------------------------------------------------------------ -->
+	<aside class="col side" id="side">
+		<section class="pane" data-pane="files">
+			<div class="pane-head">
+				<span>EXPLORER</span>
+				<span class="row-actions">
+					<button class="btn tiny" id="btn-new-file" title="new file">+F</button>
+					<button class="btn tiny" id="btn-new-dir" title="new folder">+D</button>
+					<button class="btn tiny" id="btn-refresh" title="refresh">RE</button>
+				</span>
+			</div>
+			<div class="tree" id="tree"></div>
+		</section>
+
+		<section class="pane hidden" data-pane="search">
+			<div class="pane-head"><span>SEARCH</span></div>
+			<div class="pane-body">
+				<input id="q" class="in" placeholder="TEXT OR REGEX">
+				<label class="check"><input type="checkbox" id="q-regex"> REGEX</label>
+				<label class="check"><input type="checkbox" id="q-case"> CASE</label>
+				<button class="btn solid wide" id="btn-search">RUN SEARCH</button>
+				<div class="hits" id="hits"></div>
+			</div>
+		</section>
+
+		<section class="pane hidden" data-pane="tools">
+			<div class="pane-head"><span>RUNTIME</span></div>
+			<div class="pane-body" id="runtime"></div>
+		</section>
+	</aside>
+
+	<!-- CENTER ---------------------------------------------------------- -->
+	<section class="col center">
+		<div class="tabs" id="tabs"></div>
+		<div class="editor-wrap">
+			<div class="gutter" id="gutter"></div>
+			<div class="code-host">
+				<pre class="hl" id="hl" aria-hidden="true"></pre>
+				<textarea id="code" spellcheck="false" wrap="off"
+					placeholder="OPEN A FILE FROM THE EXPLORER"></textarea>
+			</div>
+		</div>
+		<div class="strip" id="diags"></div>
+		<div class="term-wrap" id="term-wrap">
+			<div class="pane-head">
+				<span>TERMINAL</span>
+				<span class="row-actions">
+					<button class="btn tiny" id="btn-term">OPEN</button>
+					<button class="btn tiny" id="btn-term-kill">KILL</button>
+					<button class="btn tiny" id="btn-term-toggle">HIDE</button>
+				</span>
+			</div>
+			<pre class="term" id="term" tabindex="0"></pre>
+		</div>
+	</section>
+
+	<!-- RIGHT ----------------------------------------------------------- -->
+	<aside class="col chat">
+		<div class="pane-head">
+			<span>AGENT</span>
+			<span class="row-actions">
+				<button class="btn tiny" id="btn-auto" title="auto approve actions">AUTO OFF</button>
+				<button class="btn tiny" id="btn-ctx" title="attach open file">CTX ON</button>
+				<button class="btn tiny" id="btn-account" title="notion account">ACCOUNT</button>
+				<button class="btn tiny" id="btn-new-chat">NEW</button>
+			</span>
+		</div>
+		<div class="log" id="log">
+			<div class="boot">
+				<div class="boot-tag">LOCAL EDITOR BRIDGE</div>
+				<p>The assistant runs through a local runner. It emits action blocks,
+				the runner executes them on this machine and returns real output.</p>
+				<div class="boot-grid">
+					<div><b id="m-ide">-</b><span>IDE MB</span></div>
+					<div><b id="m-lsp">-</b><span>LSP MB</span></div>
+					<div><b id="m-mcp">0</b><span>MCP</span></div>
+					<div><b id="m-up">0</b><span>UPTIME S</span></div>
+				</div>
+			</div>
+		</div>
+		<div class="composer">
+			<textarea id="msg" rows="3" placeholder="DESCRIBE THE TASK…  (ENTER TO SEND, SHIFT+ENTER NEWLINE)"></textarea>
+			<div class="composer-row">
+				<span class="muted" id="chat-status">IDLE</span>
+				<span class="spacer"></span>
+				<button class="btn ghost" id="btn-stop" disabled>STOP</button>
+				<button class="btn solid" id="btn-send">SEND ↗</button>
+			</div>
+		</div>
+	</aside>
+</main>
+
+<footer class="bar bottom">
+	<span id="st-file">NO FILE</span>
+	<span class="sep"></span>
+	<span id="st-pos">1:1</span>
+	<span class="sep"></span>
+	<span id="st-lsp">LSP IDLE</span>
+	<span class="spacer"></span>
+	<span id="st-mem">MEM –</span>
+	<span class="sep"></span>
+	<span id="st-upstream">UPSTREAM –</span>
+</footer>
+
+<!-- modal ---------------------------------------------------------------- -->
+<div class="veil hidden" id="veil">
+	<div class="modal">
+		<div class="pane-head"><span id="modal-title">CONFIG</span>
+			<button class="btn tiny" id="modal-x">X</button></div>
+		<div class="modal-body" id="modal-body"></div>
+		<div class="modal-foot" id="modal-foot"></div>
+	</div>
+</div>
+
+<!-- login gate --------------------------------------------------------- -->
+<div class="gate" id="gate">
+	<div class="gate-box">
+		<div class="gate-head">
+			<span class="mark"></span>
+			<span>NOTION ACCOUNT REQUIRED</span>
+		</div>
+		<div class="gate-body">
+			<p class="gate-note">
+				The agent stays locked until an account is attached. A browser opens in a
+				throwaway profile, you sign in, and <code>token_v2</code> plus the workspace
+				fields are read from that session.
+			</p>
+			<div class="gate-label">1 / PICK A BROWSER</div>
+			<div class="gate-browsers" id="gate-browsers"></div>
+			<div class="gate-label">2 / PROGRESS</div>
+			<pre class="gate-log" id="gate-log">WAITING FOR A BROWSER CHOICE</pre>
+			<div class="gate-label hidden" id="gate-pick-label">3 / PICK A WORKSPACE</div>
+			<div class="gate-pick hidden" id="gate-pick"></div>
+			<details class="gate-manual" id="gate-manual">
+				<summary>PASTE TOKEN_V2 MANUALLY</summary>
+				<p class="gate-note">
+					Sign in at notion.so, then F12 - Application/Storage - Cookies -
+					www.notion.so - copy <code>token_v2</code>. Required for Firefox, which has
+					no DevTools Protocol endpoint.
+				</p>
+				<div class="gate-row">
+					<input id="gate-token" class="in" placeholder="TOKEN_V2" autocomplete="off">
+					<button class="btn solid" id="gate-token-go">ATTACH</button>
+				</div>
+			</details>
+		</div>
+		<div class="gate-foot">
+			<span class="muted" id="gate-status">LOCKED</span>
+			<span class="spacer"></span>
+			<button class="btn ghost hidden" id="gate-cancel">CANCEL</button>
+		</div>
+	</div>
+</div>
+
+<script src="/editor.js"></script>
+<script src="/chat.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>
