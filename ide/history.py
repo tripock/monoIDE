@@ -12,6 +12,11 @@ Two storage modes, chosen on the first message of a chat and fixed afterwards
     message went through a Notion thread and Notion keeps it - so the list is
     fetched back from the workspace instead of read from disk.
 
+The file on disk is the identity of a local chat: the listing reports the file
+name as the id and ``Store.load`` opens that file. A record also carries an
+``id`` field, and if the two ever disagree the file still wins, because that is
+what the user can see, grep and delete.
+
 The importer reads Claude Code sessions (``~/.claude/projects/<project>/<uuid>.jsonl``,
 on Windows ``%USERPROFILE%\\.claude\\projects\\...``). The format was taken from a
 real export rather than guessed:
@@ -43,8 +48,10 @@ HISTORY_DIRNAME = "chats"
 STORAGE_MODES = ("local", "web")
 DEFAULT_STORAGE = "local"
 
-# a chat file bigger than this is refused rather than loaded into memory
-MAX_CHAT_BYTES = 8 * 1024 * 1024
+# A guard against loading something absurd into memory, not a feature limit: a
+# long agent session with big tool output is easily tens of megabytes, and
+# refusing to reopen a chat the IDE itself wrote would be a bug.
+MAX_CHAT_BYTES = 64 * 1024 * 1024
 # an imported session bigger than this is refused; the real ones are ~200 KB
 MAX_IMPORT_BYTES = 64 * 1024 * 1024
 TITLE_LIMIT = 80
@@ -110,32 +117,60 @@ class Store:
     def _path(self, chat_id: str) -> Path:
         ident = str(chat_id or "").strip()
         if not _SAFE_ID.match(ident):
-            raise HistoryError("bad chat id")
+            raise HistoryError("bad chat id: %r" % (chat_id,))
         return self.dir / f"{ident}.json"
 
     def exists(self, chat_id: str) -> bool:
         try:
-            return self._path(chat_id).is_file()
+            return self.resolve(chat_id) is not None
         except HistoryError:
             return False
+
+    def resolve(self, chat_id: str) -> Optional[Path]:
+        """The file holding this chat, by file name or by the record's own id.
+
+        The second lookup is the safety net: a record whose ``id`` field drifted
+        away from its file name is still perfectly readable, and answering "no
+        such chat" for a file sitting in the folder would be indefensible.
+        """
+        path = self._path(chat_id)
+        if path.is_file():
+            return path
+        wanted = str(chat_id or "").strip()
+        if not self.dir.is_dir():
+            return None
+        for candidate in self.dir.glob("*.json"):
+            try:
+                record = json.loads(candidate.read_text("utf-8", errors="replace"))
+            except Exception:
+                continue
+            if isinstance(record, dict) and str(record.get("id") or "") == wanted:
+                return candidate
+        return None
 
     # -- reading -------------------------------------------------------------
 
     def load(self, chat_id: str) -> Dict[str, Any]:
-        path = self._path(chat_id)
+        path = self.resolve(chat_id)
+        if path is None:
+            # The path is part of the message on purpose: when this does go
+            # wrong, the folder it looked in is the whole diagnosis.
+            raise HistoryError("no such chat: %s" % self._path(chat_id))
         try:
-            if path.stat().st_size > MAX_CHAT_BYTES:
-                raise HistoryError("chat file is too large to open")
-            record = json.loads(path.read_text("utf-8"))
+            size = path.stat().st_size
+            if size > MAX_CHAT_BYTES:
+                raise HistoryError(
+                    "that chat is %d MB, too large to open" % (size // (1024 * 1024))
+                )
+            record = json.loads(path.read_text("utf-8", errors="replace"))
         except HistoryError:
             raise
-        except FileNotFoundError:
-            raise HistoryError("no such chat") from None
         except Exception as exc:
-            raise HistoryError(f"unreadable chat: {exc}") from exc
+            raise HistoryError(f"unreadable chat {path.name}: {exc}") from exc
         if not isinstance(record, dict):
-            raise HistoryError("unreadable chat: not an object")
-        record.setdefault("id", chat_id)
+            raise HistoryError(f"unreadable chat {path.name}: not an object")
+        # the file name is the identity the UI was given, so hand it back
+        record["id"] = path.stem
         record.setdefault("messages", [])
         return record
 
@@ -146,12 +181,15 @@ class Store:
             return out
         for path in self.dir.glob("*.json"):
             try:
-                record = json.loads(path.read_text("utf-8"))
+                record = json.loads(path.read_text("utf-8", errors="replace"))
                 if not isinstance(record, dict):
                     continue
             except Exception:
                 continue
-            out.append(summarize(record, fallback_id=path.stem))
+            row = summarize(record, fallback_id=path.stem)
+            # what the UI clicks must be what load() opens
+            row["id"] = path.stem
+            out.append(row)
         out.sort(key=lambda row: row.get("updated") or 0, reverse=True)
         return out
 
@@ -182,13 +220,14 @@ class Store:
         return record
 
     def delete(self, chat_id: str) -> bool:
+        path = self.resolve(chat_id)
+        if path is None:
+            return False
         try:
-            self._path(chat_id).unlink()
+            path.unlink()
             return True
         except FileNotFoundError:
             return False
-        except HistoryError:
-            raise
         except Exception as exc:
             raise HistoryError(f"could not delete the chat: {exc}") from exc
 
@@ -212,6 +251,7 @@ def summarize(record: Dict[str, Any], fallback_id: str = "") -> Dict[str, Any]:
         "storage": normalize_storage(record.get("storage")),
         "source": str(record.get("source") or "ide"),
         "messages": len(spoken),
+        "entries": len(messages),
         "agent": record.get("agent") or {},
         "origin": record.get("origin") or {},
     }
@@ -494,8 +534,14 @@ def remote_chats(root: str | os.PathLike[str]) -> Dict[str, Any]:
     Only the custom-agent listing is verified against the real workspace, so
     that is all this promises. With the default assistant selected the answer
     says so plainly instead of inventing an endpoint.
+
+    Each row carries a ``url`` that opens the agent's chat page in Notion. It is
+    the agent page rather than the single thread on purpose: the per-thread deep
+    link is not something this project has verified, and a made-up link that
+    lands nowhere would be worse than one that lands next to the chat.
     """
     from .agents import AgentError, load_account, recent_chats
+    from .auth import NOTION_URL
     from .config import Config, read_agent_selection
 
     try:
@@ -515,10 +561,19 @@ def remote_chats(root: str | os.PathLike[str]) -> Dict[str, Any]:
             "error": "web history is listed for custom agents; "
             "open Notion itself for default assistant chats",
         }
+    agent_id = selection["agent_id"]
+    agent_url = "%s/agent/%s?wfv=chat" % (NOTION_URL.rstrip("/"), agent_id)
     try:
-        return {"chats": recent_chats(account, selection["agent_id"])}
+        chats = recent_chats(account, agent_id)
     except AgentError as exc:
-        return {"chats": [], "error": str(exc)}
+        return {"chats": [], "error": str(exc), "agent_url": agent_url}
+    for chat in chats:
+        chat.setdefault("url", agent_url)
+    return {
+        "chats": chats,
+        "agent_url": agent_url,
+        "agent_name": selection.get("agent_name", ""),
+    }
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -529,6 +584,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--workspace", default=os.getcwd())
     parser.add_argument("--import", dest="import_path", default="")
     parser.add_argument("--discover", action="store_true")
+    parser.add_argument("--open", dest="open_id", default="")
     parser.add_argument("--thinking", action="store_true")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
@@ -559,6 +615,24 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"{origin.get('spoken_messages', 0)} spoken, "
             f"{origin.get('skipped_lines', 0)} lines skipped"
         )
+        return 0
+
+    # The same read path the editor uses, so a chat that will not open in the UI
+    # can be reproduced here in one command.
+    if args.open_id:
+        try:
+            record = Store(args.workspace).load(args.open_id)
+        except HistoryError as exc:
+            print(f"could not open: {exc}")
+            return 1
+        if args.json:
+            print(json.dumps(record, ensure_ascii=False, indent=1))
+            return 0
+        print(f"{record['id']}  {record.get('title', '')}")
+        for message in record.get("messages", []):
+            kind = message.get("kind") or "message"
+            head = f"[{message.get('role', '?')}/{kind}]"
+            print(f"{head:<24} {str(message.get('content', ''))[:120]}")
         return 0
 
     rows = Store(args.workspace).list()
