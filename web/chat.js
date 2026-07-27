@@ -36,7 +36,7 @@
 			digits.slice(16, 20), digits.slice(20)].join("-");
 	}
 
-	/* "3 hours ago" from a millisecond stamp; "" when there is none */
+	/* "3H AGO" from a millisecond stamp; "" when there is none */
 	function ago(ms) {
 		const stamp = Number(ms || 0);
 		if (!stamp) return "";
@@ -391,25 +391,20 @@
 		const say = (text) => { hint.textContent = String(text || "").toUpperCase(); };
 		const empty = (text) => { rows.innerHTML = '<span class="muted">' + esc(text) + "</span>"; };
 
-		const rowHtml = (row, actions) =>
-			'<div class="row">' +
-			'<button class="btn" data-open="' + attr(row.id) + '"' +
-			' title="' + attr(row.subtitle || "") + '">' +
-			esc(String(row.title || "untitled").toUpperCase().slice(0, 44)) + "</button>" +
-			'<span class="muted">' + esc(row.meta || "") + "</span>" + (actions || "") +
-			"</div>";
-
 		const renderLocal = (payload) => {
 			const chats = (payload && payload.chats) || [];
 			if (!chats.length) return empty("NOTHING KEPT ON THIS PC YET");
-			rows.innerHTML = chats.map((chat) => rowHtml({
-				id: chat.id,
-				title: chat.title,
-				meta: [ago(chat.updated), (chat.messages || 0) + " MSG",
+			rows.innerHTML = chats.map((chat) =>
+				'<div class="row">' +
+				'<button class="btn" data-open="' + attr(chat.id) + '"' +
+				' title="' + attr(chat.id) + '">' +
+				esc(String(chat.title || "untitled").toUpperCase().slice(0, 44)) + "</button>" +
+				'<span class="muted">' + esc([ago(chat.updated),
+					(chat.messages || 0) + " MSG",
 					chat.source === "claude-code" ? "IMPORTED" : ""]
-					.filter(Boolean).join("  "),
-				subtitle: chat.id,
-			}, '<button class="btn" data-drop="' + attr(chat.id) + '">DEL</button>')).join("");
+					.filter(Boolean).join("  ")) + "</span>" +
+				'<button class="btn" data-drop="' + attr(chat.id) + '">DEL</button>' +
+				"</div>").join("");
 			rows.querySelectorAll("button[data-open]").forEach((button) => {
 				button.onclick = () => this.openChat(button.dataset.open);
 			});
@@ -423,6 +418,7 @@
 							body: JSON.stringify({ id: button.dataset.drop }),
 						});
 					} catch (err) {
+						button.disabled = false;
 						return say("could not delete: " + err.message);
 					}
 					button.closest(".row").remove();
@@ -431,12 +427,12 @@
 		};
 
 		const renderWeb = (payload) => {
-			const chats = (payload && payload.chats) || [];
 			if (payload && payload.error) return empty(String(payload.error).toUpperCase());
+			const chats = (payload && payload.chats) || [];
 			if (!chats.length) {
 				return empty("NO CHATS IN NOTION FOR THE SELECTED AGENT YET");
 			}
-			// Web chats live in Notion, so there is nothing here to open locally.
+			// These live in Notion, so there is nothing here to open locally.
 			rows.innerHTML = chats.map((chat) =>
 				'<div class="row"><span>' +
 				esc(String(chat.title || "untitled").toUpperCase().slice(0, 44)) + "</span>" +
@@ -450,14 +446,15 @@
 				return empty("NO CLAUDE CODE SESSIONS FOUND UNDER " +
 					String((payload && payload.dir) || "~/.claude/projects").toUpperCase());
 			}
+			// field names come from discover_claude_sessions: bytes, updated, name
 			rows.innerHTML = sessions.map((item) =>
 				'<div class="row">' +
 				'<button class="btn" data-import="' + attr(item.path) + '"' +
 				' title="' + attr(item.path) + '">' +
-				esc(String(item.project || item.id || "session").toUpperCase().slice(0, 40)) +
+				esc(String(item.project || item.name || "session").toUpperCase().slice(0, 40)) +
 				"</button>" +
-				'<span class="muted">' + esc([ago(item.modified),
-					item.size ? Math.round(item.size / 1024) + " KB" : ""]
+				'<span class="muted">' + esc([ago(item.updated),
+					item.bytes ? Math.max(1, Math.round(item.bytes / 1024)) + " KB" : ""]
 					.filter(Boolean).join("  ")) + "</span></div>").join("");
 			rows.querySelectorAll("button[data-import]").forEach((button) => {
 				button.onclick = async () => {
@@ -480,8 +477,9 @@
 							((result && result.error) || "unknown reason"));
 					}
 					const chat = result.chat || {};
-					say("imported " + (chat.messages || 0) + " messages - see ON THIS PC");
 					button.textContent = "IMPORTED";
+					say("imported " + (chat.messages || 0) +
+						" messages - see ON THIS PC");
 				};
 			});
 			say("imports are kept on this pc, next to your local chats");
@@ -543,25 +541,27 @@
 				const node = this.el("think", "");
 				node.textContent = text;
 			} else if (message.kind === "action") {
-				lastAct = this.el("act",
+				const act = this.el("act",
 					'<div class="hd"><span class="tg">' + esc(message.tool || "tool") + "</span>" +
 					'<span class="sm"></span><span class="st">RAN</span></div>' +
 					'<pre class="hidden"></pre>');
-				lastAct.querySelector(".sm").textContent = text.split("\n")[0].slice(0, 120);
-				lastAct.querySelector("pre").textContent = text;
-				const act = lastAct;
+				act.querySelector(".sm").textContent = text.split("\n")[0].slice(0, 120);
+				act.querySelector("pre").textContent = text;
 				act.querySelector(".hd").onclick = () =>
 					act.querySelector("pre").classList.toggle("hidden");
+				lastAct = act;
 			} else if (message.kind === "observation") {
 				if (lastAct) {
 					lastAct.querySelector(".st").textContent = message.failed ? "FAIL" : "OK";
 					if (message.failed) lastAct.classList.add("fail");
-					const pre = lastAct.querySelector("pre");
-					pre.textContent = text;
+					lastAct.querySelector("pre").textContent = text;
 					lastAct = null;
 				} else {
-					this.el("act", '<div class="hd"><span class="tg">OUTPUT</span></div>')
-						.appendChild(document.createElement("pre")).textContent = text;
+					const act = this.el("act",
+						'<div class="hd"><span class="tg">OUTPUT</span>' +
+						'<span class="st">' + (message.failed ? "FAIL" : "OK") + "</span></div>" +
+						"<pre></pre>");
+					act.querySelector("pre").textContent = text;
 				}
 			} else if (message.role === "user") {
 				this.el("msg user",
