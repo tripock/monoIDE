@@ -30,6 +30,10 @@ real export rather than guessed:
   where ``content`` is always a string);
 * a tool result arrives as a ``user`` record, which is a transport detail, not
   something the user said - it is imported as an observation, not as a prompt;
+* the first ``user`` record of a real session is usually not a prompt either but
+  Claude Code's own preamble (``<local-command-caveat>``, ``<command-name>``,
+  ``<system-reminder>``); those are kept in the transcript and skipped when
+  picking a title, otherwise every import ends up named "CAVEAT: THE MESSAGES";
 * records are a tree (``uuid`` / ``parentUuid``) but file order is already the
   order things happened, so the import keeps file order and ignores the links.
 """
@@ -59,6 +63,20 @@ TITLE_LIMIT = 80
 OBSERVATION_LIMIT = 4000
 
 _SAFE_ID = re.compile(r"^[0-9a-zA-Z._-]{1,80}$")
+
+# Openers of the machine-written "user" turns Claude Code injects. Taken from a
+# real export; matched case-insensitively on the first non-space characters.
+_MACHINE_PROMPT_HEADS = (
+    "<local-command-caveat",
+    "<local-command-stdout",
+    "<local-command-stderr",
+    "<command-name",
+    "<command-message",
+    "<command-args",
+    "<system-reminder",
+    "<user-memory-input",
+    "caveat:",
+)
 
 
 class HistoryError(RuntimeError):
@@ -91,6 +109,12 @@ def title_from(text: str) -> str:
     if space > TITLE_LIMIT // 2:
         cut = cut[:space]
     return cut.rstrip() + "\u2026"
+
+
+def _machine_written(text: str) -> bool:
+    """True for a "user" turn that the tool wrote, not the person."""
+    head = str(text or "").lstrip().lower()
+    return any(head.startswith(mark) for mark in _MACHINE_PROMPT_HEADS)
 
 
 def _clip(text: str, limit: int) -> str:
@@ -328,6 +352,23 @@ def _tool_call_text(block: Dict[str, Any]) -> str:
     return f"{name}\n{_clip(rendered, OBSERVATION_LIMIT)}"
 
 
+def _import_title(messages: List[Dict[str, Any]], cwd: str) -> str:
+    """Name the import after the first thing the person actually typed.
+
+    Real sessions open with Claude Code's own injected turns, so the first user
+    message is almost never a prompt. When every prompt is machine-written the
+    project folder is a far better name than the caveat text.
+    """
+    for message in messages:
+        if message.get("role") != "user" or message.get("kind") != "message":
+            continue
+        body = str(message.get("content") or "").strip()
+        if body and not _machine_written(body):
+            return title_from(body)
+    folder = Path(str(cwd or "")).name
+    return f"claude code: {folder}" if folder else "claude code session"
+
+
 def parse_claude_session(
     text: str, *, include_thinking: bool = False
 ) -> Dict[str, Any]:
@@ -421,18 +462,10 @@ def parse_claude_session(
     if not messages:
         raise HistoryError("no conversation found in this file")
 
-    first_user = next(
-        (
-            m["content"]
-            for m in messages
-            if m["role"] == "user" and m["kind"] == "message" and m["content"]
-        ),
-        "",
-    )
     spoken = sum(1 for m in messages if m["kind"] == "message")
     return {
         "id": new_id(),
-        "title": title_from(first_user),
+        "title": _import_title(messages, cwd),
         "created": started or now_ms(),
         "updated": ended or now_ms(),
         "storage": "local",
