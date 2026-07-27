@@ -1,13 +1,21 @@
 """Configuration. Zero third-party dependencies: stdlib json only.
 
 Config file: <workspace>/.monoide/config.json  (falls back to defaults)
+
+The file also decides which assistant answers in the chat panel: the default
+Notion AI, or one of the user's own agents. A custom agent lives in the
+workspace that created it, so its id is always something the user pastes - see
+``write_agent_target``, which hands the choice to the notion2api child process.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
+import sys
+import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Dict, List
@@ -29,6 +37,13 @@ DEFAULTS: Dict[str, Any] = {
         # keep one Notion chat per IDE chat session by replaying the
         # conversation_id notion2api returns in X-Conversation-Id
         "reuse_conversation": True,
+        # "notion" = the default Notion AI assistant,
+        # "custom"  = the agent identified by agent_url / agent_id below.
+        # Never ship a real agent id here: agents are workspace-local.
+        "agent_mode": "notion",
+        "agent_url": "",
+        "agent_id": "",
+        "agent_name": "",
         "api_key": "",
         "model": "claude-sonnet4.6",
         "stream": True,
@@ -132,6 +147,7 @@ class Config:
         env_key = os.environ.get("MONOIDE_API_KEY")
         env_model = os.environ.get("MONOIDE_MODEL")
         env_mode = os.environ.get("MONOIDE_APP_MODE")
+        env_agent = os.environ.get("MONOIDE_AGENT_URL")
         if env_base:
             data["upstream"]["base_url"] = env_base
             # an explicit base url means "use my own notion2api"
@@ -142,6 +158,10 @@ class Config:
             data["upstream"]["model"] = env_model
         if env_mode:
             data["upstream"]["app_mode"] = env_mode
+        if env_agent:
+            data["upstream"]["agent_url"] = env_agent
+            data["upstream"]["agent_id"] = agent_id_from_url(env_agent)
+            data["upstream"]["agent_mode"] = "custom" if data["upstream"]["agent_id"] else "notion"
         return cls(root=root_path, data=data)
 
     def save(self) -> None:
@@ -177,6 +197,99 @@ class Config:
             out["upstream"]["api_key"] = "***"
         out["_root"] = str(self.root)
         return out
+
+
+# ---------------------------------------------------------------------------
+# which assistant answers: Notion AI or one of the user's own agents
+# ---------------------------------------------------------------------------
+
+AGENT_TARGET_FILENAME = "agent-target.json"
+
+_UUID = re.compile(
+    r"[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}"
+)
+
+
+def agent_id_from_url(raw: str) -> str:
+    """Pull the agent id out of whatever the user pasted.
+
+    Accepts a full notion.so link, a dashed uuid or a dashless one, and returns
+    a dashed uuid (or "" when there is no id in the text at all). Query strings
+    are cut off first, so a ``?pvs=`` tail cannot be mistaken for the id.
+    """
+    text = str(raw or "").split("?")[0].split("#")[0]
+    found = _UUID.findall(text)
+    if not found:
+        return ""
+    digits = re.sub(r"[^0-9a-fA-F]", "", found[-1]).lower()
+    if len(digits) != 32:
+        return ""
+    return "-".join(
+        [digits[:8], digits[8:12], digits[12:16], digits[16:20], digits[20:]]
+    )
+
+
+def state_dir() -> Path:
+    """Where the app keeps state shared with the notion2api child process."""
+    override = os.environ.get("MONOIDE_STATE_DIR")
+    if override:
+        return Path(override)
+    if sys.platform.startswith("win"):
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        return Path(base) / "monoide"
+    if sys.platform == "darwin":
+        return Path(os.path.expanduser("~/Library/Application Support/monoide"))
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return Path(base) / "monoide"
+
+
+def agent_target_path() -> Path:
+    override = os.environ.get("MONOIDE_AGENT_FILE")
+    return Path(override) if override else state_dir() / AGENT_TARGET_FILENAME
+
+
+def read_agent_selection(config: "Config") -> Dict[str, str]:
+    """Normalised view of the agent settings.
+
+    A selection is only "custom" when there is an id to point at; a half-filled
+    config silently falls back to the default assistant instead of failing.
+    """
+    mode = str(config.get("upstream", "agent_mode", default="notion") or "notion")
+    url = str(config.get("upstream", "agent_url", default="") or "").strip()
+    raw_id = str(config.get("upstream", "agent_id", default="") or "").strip()
+    name = str(config.get("upstream", "agent_name", default="") or "").strip()
+    agent_id = agent_id_from_url(raw_id) or agent_id_from_url(url)
+    if mode.strip().lower() != "custom" or not agent_id:
+        return {"mode": "notion", "agent_id": "", "agent_url": "", "agent_name": ""}
+    return {
+        "mode": "custom",
+        "agent_id": agent_id,
+        "agent_url": url,
+        "agent_name": name or "custom agent",
+    }
+
+
+def write_agent_target(config: "Config") -> str:
+    """Publish the choice for notion2api. Returns the agent id ("" = default).
+
+    notion2api runs as a separate process, so the selection travels through a
+    tiny json file both sides agree on (vendor/notion2api/app/agent_override.py
+    reads it). Writing it before every turn means switching agents takes effect
+    on the next message, with no restart.
+    """
+    selection = read_agent_selection(config)
+    payload = dict(selection)
+    payload["updated"] = time.time()
+    path = agent_target_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload, indent=2, ensure_ascii=False), "utf-8")
+        os.replace(temporary, path)
+    except OSError:
+        # not fatal: without the file notion2api keeps using the default agent
+        pass
+    return selection["agent_id"]
 
 
 def describe_environment(root: Path) -> Dict[str, str]:
