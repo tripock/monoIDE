@@ -401,6 +401,17 @@ class Workspace:
         self.sessions[new_id] = session
         return session
 
+    def agent_label(self) -> Dict[str, Any]:
+        """Who is answering, as stored on a history record."""
+        from .config import read_agent_selection  # noqa: PLC0415
+
+        selection = read_agent_selection(self.config.as_json().get("upstream", {}))
+        return {
+            "mode": selection.get("mode", "notion"),
+            "id": selection.get("agent_id", ""),
+            "name": selection.get("agent_name", ""),
+        }
+
     # -- filesystem --------------------------------------------------------
     def safe(self, raw: str) -> Path:
         candidate = Path(unquote(raw or "."))
@@ -619,6 +630,39 @@ class Handler(BaseHTTPRequestHandler):
                 # back to pasting a link.
                 return self._json({"agents": [], "error": str(exc)})
 
+        # -- chat history ---------------------------------------------------
+        if route == "/api/chat/sessions":
+            from . import history  # noqa: PLC0415
+
+            return self._json({
+                "chats": history.Store(workspace.root).list(),
+                "default_storage": history.normalize_storage(
+                    workspace.config.get("chat", "storage", default=history.DEFAULT_STORAGE)
+                ),
+            })
+
+        if route == "/api/chat/session":
+            from . import history  # noqa: PLC0415
+
+            try:
+                return self._json(history.Store(workspace.root).load(first("id")))
+            except history.HistoryError as exc:
+                return self._error(str(exc), 404)
+
+        # Chats that were never written to this machine still exist in Notion.
+        if route == "/api/chat/remote":
+            from . import history  # noqa: PLC0415
+
+            return self._json(history.remote_chats(workspace.root))
+
+        if route == "/api/chat/imports":
+            from . import history  # noqa: PLC0415
+
+            return self._json({
+                "sessions": history.discover_claude_sessions(),
+                "dir": str(history.claude_projects_dir()),
+            })
+
         if route == "/api/tree":
             return self._json({"entries": workspace.tree(first("path", "."))})
 
@@ -826,6 +870,28 @@ class Handler(BaseHTTPRequestHandler):
             workspace.sessions.pop(session_id, None)
             return self._json({"ok": True})
 
+        if route == "/api/chat/import":
+            from . import history  # noqa: PLC0415
+
+            try:
+                record = history.import_claude_file(
+                    workspace.root,
+                    str(body.get("path") or ""),
+                    include_thinking=bool(body.get("thinking")),
+                )
+            except history.HistoryError as exc:
+                return self._json({"ok": False, "error": str(exc)}, 400)
+            return self._json({"ok": True, "chat": history.summarize(record)})
+
+        if route == "/api/chat/delete":
+            from . import history  # noqa: PLC0415
+
+            try:
+                removed = history.Store(workspace.root).delete(str(body.get("id") or ""))
+            except history.HistoryError as exc:
+                return self._json({"ok": False, "error": str(exc)}, 400)
+            return self._json({"ok": removed})
+
         if route == "/api/auth/login":
             browser = str(body.get("browser") or "chrome")
             timeout = int(
@@ -916,12 +982,26 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- chat SSE ----------------------------------------------------------
     def _chat(self, body: Dict[str, Any]) -> None:
+        from . import history  # noqa: PLC0415
+
         workspace = self.workspace
         session = workspace.session(body.get("session"))
         message = str(body.get("message") or "").strip()
         if not message:
             return self._error("empty message")
         attachments = [str(item) for item in (body.get("attachments") or [])]
+
+        # The storage choice belongs to the chat, not to the request: it is read
+        # from the first message and then pinned, so a later request cannot move
+        # a conversation that is already half-written to disk. This is the same
+        # rule the UI expresses by hiding the switch after the first message.
+        if not getattr(session, "storage", ""):
+            session.storage = history.normalize_storage(
+                body.get("storage")
+                or workspace.config.get("chat", "storage", default=history.DEFAULT_STORAGE)
+            )
+        if not getattr(session, "chat_id", ""):
+            session.chat_id = str(body.get("chat") or "").strip() or history.new_id()
 
         events: "queue.Queue[tuple[str, Any]]" = queue.Queue()
         finished = threading.Event()
@@ -940,6 +1020,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._sse_open()
         self._sse_send("session", {"id": session.id})
+        self._sse_send("chat", {"id": session.chat_id, "storage": session.storage})
         while True:
             try:
                 kind, data = events.get(timeout=20)
@@ -952,8 +1033,37 @@ class Handler(BaseHTTPRequestHandler):
             if kind == "__end__":
                 break
             if not self._sse_send(kind, data):
-                return  # browser went away; worker keeps or stops on its own
-        self._sse_send("end", {})
+                # The browser went away mid-turn. The worker keeps running, so
+                # let it finish and still write the transcript to disk.
+                finished.wait(timeout=900)
+                self._persist(session)
+                return
+        self._persist(session)
+        self._sse_send("end", {"chat": session.chat_id, "storage": session.storage})
+
+    def _persist(self, session: Session) -> None:
+        """Write the finished turn to disk, unless the chat is web-only.
+
+        History is never worth failing a chat over: a full disk or a read-only
+        project folder costs the log, not the answer.
+        """
+        from . import history  # noqa: PLC0415
+
+        workspace = self.workspace
+        if getattr(session, "storage", history.DEFAULT_STORAGE) != "local":
+            return
+        try:
+            history.Store(workspace.root).save(
+                history.record_from_session(
+                    session,
+                    chat_id=getattr(session, "chat_id", ""),
+                    storage="local",
+                    agent=workspace.agent_label(),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            if os.environ.get("MONOIDE_VERBOSE"):
+                print("[ide] could not save the chat: %s" % exc)
 
 
 # ---------------------------------------------------------------------------
