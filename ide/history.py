@@ -17,6 +17,30 @@ name as the id and ``Store.load`` opens that file. A record also carries an
 ``id`` field, and if the two ever disagree the file still wins, because that is
 what the user can see, grep and delete.
 
+What every entry of a transcript is
+-----------------------------------
+A live session (``ide.agent.Session``) keeps one flat list of ``user`` and
+``assistant`` messages, because that is what an OpenAI-style request wants. Most
+of those "user" messages were never typed by anyone:
+
+* message 0 is the editor's setup message (``prompts.BRIDGE_PREAMBLE``);
+* every tool round comes back as a "user" message wrapped in
+  ``prompts.OBSERVATION_HEADER`` - that is where whole files end up;
+* a real prompt is prefixed with ``prompts.TURN_REMINDER``;
+* a refusal repair is the editor talking as well.
+
+Replayed as-is that looks like the person pasting their own project into the
+chat. So each entry is labelled here, at write time, with a ``kind``
+(``message``, ``preamble``, ``action``, ``observation``, ``thinking``) and, when
+it is known, the ``tool`` that produced it - and the wrappers are stripped from
+the stored text.
+
+The labels stay on this side of the wire on purpose. Marking the setup prompt
+with something like ``<system_prompt>`` inside the request is precisely the
+shape that makes the model answer "this is a prompt injection attempt" instead
+of working (see ``prompts.py``), so nothing about this changes what is sent
+upstream.
+
 The importer reads Claude Code sessions (``~/.claude/projects/<project>/<uuid>.jsonl``,
 on Windows ``%USERPROFILE%\\.claude\\projects\\...``). The format was taken from a
 real export rather than guessed:
@@ -29,13 +53,20 @@ real export rather than guessed:
   (``{id, name, input}``) and ``tool_result`` (``{tool_use_id, content, is_error}``,
   where ``content`` is always a string);
 * a tool result arrives as a ``user`` record, which is a transport detail, not
-  something the user said - it is imported as an observation, not as a prompt;
+  something the user said - it is imported as an observation, not as a prompt,
+  and ``tool_use_id`` is resolved back to the tool's name so the transcript can
+  say which one it was;
 * the first ``user`` record of a real session is usually not a prompt either but
   Claude Code's own preamble (``<local-command-caveat>``, ``<command-name>``,
   ``<system-reminder>``); those are kept in the transcript and skipped when
   picking a title, otherwise every import ends up named "CAVEAT: THE MESSAGES";
 * records are a tree (``uuid`` / ``parentUuid``) but file order is already the
   order things happened, so the import keeps file order and ignores the links.
+
+One Claude Code turn is often several blocks (text, a thought, three tool
+calls), and each block is one entry here - which is why a long session honestly
+reports four figures. ``summarize`` therefore reports both numbers: ``messages``
+counts only what was said, ``entries`` counts everything in the file.
 """
 
 from __future__ import annotations
@@ -47,6 +78,8 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
+
+from . import prompts
 
 HISTORY_DIRNAME = "chats"
 STORAGE_MODES = ("local", "web")
@@ -61,6 +94,10 @@ MAX_IMPORT_BYTES = 64 * 1024 * 1024
 TITLE_LIMIT = 80
 # tool output is kept for context, but a 200 KB directory listing is not worth it
 OBSERVATION_LIMIT = 4000
+
+# Entry kinds. "preamble" is the editor talking to the model on the user's
+# behalf; the viewer folds it away instead of showing it as a prompt.
+ENTRY_KINDS = ("message", "preamble", "action", "observation", "thinking")
 
 _SAFE_ID = re.compile(r"^[0-9a-zA-Z._-]{1,80}$")
 
@@ -77,6 +114,13 @@ _MACHINE_PROMPT_HEADS = (
     "<user-memory-input",
     "caveat:",
 )
+
+# First paragraph of the setup message. Used as a second signal, so a session
+# whose message order shifted is still recognised for what it is.
+_PREAMBLE_HEAD = prompts.BRIDGE_PREAMBLE.split("\n\n", 1)[0].strip()
+
+# agent.py pastes tool output back as "[read_file] ..." blocks
+_OBSERVATION_TOOL = re.compile(r"^\[([a-z_][a-z0-9_]*)\]", re.MULTILINE)
 
 
 class HistoryError(RuntimeError):
@@ -123,6 +167,29 @@ def _clip(text: str, limit: int) -> str:
         return body
     dropped = len(body) - limit
     return body[:limit] + f"\n\u2026 [{dropped} more characters]"
+
+
+def label_live_message(index: int, role: str, body: str) -> tuple[str, str, str]:
+    """Classify one message of a live session: ``(kind, tool, text)``.
+
+    Only "user" messages are ambiguous - everything the model sends is prose.
+    The wrapper the agent added is removed from ``text`` so the transcript shows
+    the prompt and the output, not the plumbing around them.
+    """
+    text = str(body or "")
+    if str(role) != "user":
+        return "message", "", text
+    if index == 0 or (_PREAMBLE_HEAD and text.startswith(_PREAMBLE_HEAD)):
+        return "preamble", "setup", text
+    if text.startswith(prompts.OBSERVATION_HEADER):
+        rest = text[len(prompts.OBSERVATION_HEADER):].lstrip("\n")
+        tools = list(dict.fromkeys(_OBSERVATION_TOOL.findall(rest)))
+        return "observation", ",".join(tools), rest
+    if text.strip() == prompts.REPAIR_MESSAGE.strip():
+        return "preamble", "repair", text
+    if text.startswith(prompts.TURN_REMINDER):
+        return "message", "", text[len(prompts.TURN_REMINDER):].lstrip("\n")
+    return "message", "", text
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +324,13 @@ class Store:
 
 
 def summarize(record: Dict[str, Any], fallback_id: str = "") -> Dict[str, Any]:
-    """The shape the sidebar needs: no message bodies."""
+    """The shape the sidebar needs: no message bodies.
+
+    ``messages`` counts what was actually said; ``entries`` counts every row of
+    the transcript, tool calls and pasted output included. The two differ wildly
+    on an agent session, and reporting only the big one makes an import look
+    broken.
+    """
     messages = record.get("messages")
     messages = messages if isinstance(messages, list) else []
     spoken = [
@@ -290,26 +363,30 @@ def record_from_session(
 ) -> Dict[str, Any]:
     """Snapshot a live ``ide.agent.Session`` into a history record.
 
-    The preamble is deliberately dropped: it is rebuilt for every session from
-    the current project state, so storing it would only make old chats reopen
-    with a stale picture of the tree.
+    Every entry is labelled on the way in (see ``label_live_message``), so the
+    viewer can fold the setup message and the pasted file contents away instead
+    of replaying them as things the user typed.
     """
     messages: List[Dict[str, Any]] = []
-    for message in getattr(session, "messages", []) or []:
+    for index, message in enumerate(getattr(session, "messages", []) or []):
         if not isinstance(message, dict):
             continue
         role = str(message.get("role") or "")
         if role == "system":
             continue
-        messages.append(
-            {
-                "role": role,
-                "content": str(message.get("content") or ""),
-                "kind": str(message.get("kind") or "message"),
-            }
+        kind, tool, body = label_live_message(
+            index, role, str(message.get("content") or "")
         )
+        entry: Dict[str, Any] = {"role": role, "content": body, "kind": kind}
+        if tool:
+            entry["tool"] = tool
+        messages.append(entry)
     first_user = next(
-        (m["content"] for m in messages if m["role"] == "user" and m["content"]),
+        (
+            m["content"]
+            for m in messages
+            if m["role"] == "user" and m["kind"] == "message" and m["content"]
+        ),
         "",
     )
     return {
@@ -378,6 +455,8 @@ def parse_claude_session(
     while Claude Code runs, so a half-written last line is normal.
     """
     messages: List[Dict[str, Any]] = []
+    # tool_use id -> tool name, so a result can say which tool produced it
+    called: Dict[str, str] = {}
     skipped = 0
     session_id = ""
     cwd = ""
@@ -438,12 +517,16 @@ def parse_claude_session(
                             }
                         )
             elif btype == "tool_use":
+                name = str(block.get("name") or "")
+                call_id = str(block.get("id") or "")
+                if call_id:
+                    called[call_id] = name
                 messages.append(
                     {
                         "role": "assistant",
                         "content": _tool_call_text(block),
                         "kind": "action",
-                        "tool": str(block.get("name") or ""),
+                        "tool": name,
                         "ts": stamp,
                     }
                 )
@@ -454,6 +537,7 @@ def parse_claude_session(
                         "role": "user",
                         "content": _clip(block.get("content"), OBSERVATION_LIMIT),
                         "kind": "observation",
+                        "tool": called.get(str(block.get("tool_use_id") or ""), ""),
                         "failed": bool(block.get("is_error")),
                         "ts": stamp,
                     }
@@ -479,6 +563,7 @@ def parse_claude_session(
             "version": version,
             "skipped_lines": skipped,
             "spoken_messages": spoken,
+            "entries": len(messages),
         },
         "messages": messages,
     }
@@ -664,8 +749,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"{record['id']}  {record.get('title', '')}")
         for message in record.get("messages", []):
             kind = message.get("kind") or "message"
-            head = f"[{message.get('role', '?')}/{kind}]"
-            print(f"{head:<24} {str(message.get('content', ''))[:120]}")
+            tool = message.get("tool") or ""
+            head = f"[{message.get('role', '?')}/{kind}{'/' + tool if tool else ''}]"
+            print(f"{head:<32} {str(message.get('content', ''))[:120]}")
         return 0
 
     rows = Store(args.workspace).list()
@@ -675,7 +761,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not rows:
         print("no local chats yet")
     for row in rows:
-        print(f"{row['id']}  {row['messages']:>3} msg  {row['title']}")
+        print(
+            f"{row['id']}  {row['messages']:>4} msg  "
+            f"{row['entries']:>5} entries  {row['title']}"
+        )
     return 0
 
 
