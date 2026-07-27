@@ -89,6 +89,7 @@
 			<span>AGENT</span>
 			<span class="row-actions">
 				<button class="btn tiny" id="btn-agent" title="notion ai or one of your own agents">AGENT: NOTION AI</button>
+				<button class="btn tiny" id="btn-history" title="past chats and claude code imports">HISTORY</button>
 				<button class="btn tiny" id="btn-auto" title="auto approve actions">AUTO OFF</button>
 				<button class="btn tiny" id="btn-ctx" title="attach open file">CTX ON</button>
 				<button class="btn tiny" id="btn-account" title="notion account">ACCOUNT</button>
@@ -113,6 +114,14 @@
 			<div class="composer-row">
 				<span class="muted" id="chat-status">IDLE</span>
 				<span class="spacer"></span>
+				<!-- Only offered while the chat is empty: after the first message the
+				     transcript is already being kept one way or the other. -->
+				<span class="row-actions" id="storage-pick">
+					<button class="btn tiny solid" data-s="local"
+						title="keep this chat on this machine">LOCAL HISTORY</button>
+					<button class="btn tiny" data-s="web"
+						title="keep it in notion only - nothing is written to this pc">WEB HISTORY</button>
+				</span>
 				<button class="btn ghost" id="btn-stop" disabled>STOP</button>
 				<button class="btn solid" id="btn-send">SEND ↗</button>
 			</div>
