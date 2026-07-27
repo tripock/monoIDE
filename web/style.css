@@ -88,6 +88,14 @@ body{
 .row-actions{display:flex;gap:4px}
 .pane-body{padding:8px;display:flex;flex-direction:column;gap:8px;overflow:auto;min-height:0}
 
+/* The agent pane head carries six controls in a narrow column, so its buttons
+   run one size smaller, never wrap, and clip instead of growing out of the bar. */
+.chat>.pane-head{gap:6px;padding:0 6px;overflow:hidden}
+.chat>.pane-head .row-actions{gap:3px;flex-wrap:nowrap;min-width:0;overflow:hidden}
+.chat>.pane-head .btn.tiny{font-size:9px;padding:0 5px;letter-spacing:.04em;
+	max-width:104px;flex:0 1 auto;white-space:nowrap;overflow:hidden;
+	text-overflow:ellipsis;display:inline-block;line-height:18px}
+
 /* ---------- tree ---------- */
 .tree{overflow:auto;min-height:0;flex:1 1 auto;padding:4px 0}
 .node{display:flex;align-items:center;gap:6px;padding:2px 8px;cursor:pointer;
@@ -194,6 +202,10 @@ body{
 .ask .q{font-size:11px;margin-bottom:8px}
 .ask code{background:var(--fill);display:block;padding:4px 6px;margin:6px 0;word-break:break-all}
 .ask .row{display:flex;gap:6px;flex-wrap:wrap}
+/* history rows: the title takes the space, the stamp and DEL stay put */
+.ask .row .btn[data-open],.ask .row .btn[data-web],.ask .row .btn[data-import]{
+	flex:1 1 auto;min-width:0;justify-content:flex-start;overflow:hidden;
+	white-space:nowrap;text-overflow:ellipsis;display:inline-block;line-height:26px}
 
 .composer{flex:0 0 auto;border-top:1px solid var(--line);padding:8px;display:flex;
 	flex-direction:column;gap:8px;background:var(--paper)}
