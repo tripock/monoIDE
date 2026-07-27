@@ -499,18 +499,21 @@ def remote_chats(root: str | os.PathLike[str]) -> Dict[str, Any]:
     from .config import Config, read_agent_selection
 
     try:
-        account = load_account(root)
+        account = load_account(Path(root))
     except Exception as exc:
         return {"chats": [], "error": str(exc)}
     if not account.get("token_v2"):
         return {"chats": [], "error": "sign in to Notion first"}
 
-    selection = read_agent_selection(Config(root).as_json().get("upstream", {}))
+    # Config.load is the only constructor that reads the file and fills in the
+    # defaults; Config(root) would hand back an empty one, and an empty config
+    # reads as "the default assistant" without ever failing.
+    selection = read_agent_selection(Config.load(root))
     if selection.get("mode") != "custom" or not selection.get("agent_id"):
         return {
             "chats": [],
             "error": "web history is listed for custom agents; "
-            "open notion.ai for default assistant chats",
+            "open Notion itself for default assistant chats",
         }
     try:
         return {"chats": recent_chats(account, selection["agent_id"])}
