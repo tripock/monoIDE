@@ -18,7 +18,7 @@ import sys
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Union
 
 DEFAULTS: Dict[str, Any] = {
     "upstream": {
@@ -57,6 +57,12 @@ DEFAULTS: Dict[str, Any] = {
         "auto_approve": False,
         "observation_char_limit": 24000,
         "history_char_budget": 90000,
+    },
+    "chat": {
+        # where a new chat is kept: "local" writes .monoide/chats on this
+        # machine, "web" keeps it in Notion only. Asked on the first message of
+        # a chat and fixed from then on, so this is only a default.
+        "storage": "local",
     },
     "sandbox": {
         "deny_outside_root": True,
@@ -248,16 +254,28 @@ def agent_target_path() -> Path:
     return Path(override) if override else state_dir() / AGENT_TARGET_FILENAME
 
 
-def read_agent_selection(config: "Config") -> Dict[str, str]:
+def read_agent_selection(config: Union["Config", Dict[str, Any]]) -> Dict[str, str]:
     """Normalised view of the agent settings.
+
+    Accepts a :class:`Config` or the plain ``upstream`` settings dict, because
+    callers that already hold the browser-facing config (``as_json()``) have no
+    Config instance to hand. Getting this wrong would not raise - it would
+    quietly report "notion" - so both shapes are read rather than assumed.
 
     A selection is only "custom" when there is an id to point at; a half-filled
     config silently falls back to the default assistant instead of failing.
     """
-    mode = str(config.get("upstream", "agent_mode", default="notion") or "notion")
-    url = str(config.get("upstream", "agent_url", default="") or "").strip()
-    raw_id = str(config.get("upstream", "agent_id", default="") or "").strip()
-    name = str(config.get("upstream", "agent_name", default="") or "").strip()
+    if isinstance(config, dict):
+        # either the whole config or just its "upstream" section
+        section = config.get("upstream") if isinstance(config.get("upstream"), dict) else config
+        read = lambda key, default="": section.get(key, default)  # noqa: E731
+    else:
+        read = lambda key, default="": config.get("upstream", key, default=default)  # noqa: E731
+
+    mode = str(read("agent_mode", "notion") or "notion")
+    url = str(read("agent_url", "") or "").strip()
+    raw_id = str(read("agent_id", "") or "").strip()
+    name = str(read("agent_name", "") or "").strip()
     agent_id = agent_id_from_url(raw_id) or agent_id_from_url(url)
     if mode.strip().lower() != "custom" or not agent_id:
         return {"mode": "notion", "agent_id": "", "agent_url": "", "agent_name": ""}
