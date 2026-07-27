@@ -134,10 +134,12 @@
 		if (!this.agentBtn) return;
 		const target = this.agent.id || this.agent.url;
 		const custom = this.agent.mode === "custom" && !!target;
-		const label = custom ? (this.agent.name || "CUSTOM AGENT") : "NOTION AI";
-		this.agentBtn.textContent = "AGENT: " + String(label).toUpperCase().slice(0, 22);
+		// Two words, always the same width: the pane head has six controls in a
+		// narrow column, and an agent name of any length used to push the button
+		// out of the bar. The name belongs in the tooltip, not in the label.
+		this.agentBtn.textContent = custom ? "CUSTOM AGENT" : "NOTION AI";
 		this.agentBtn.title = custom
-			? "custom agent: " + target
+			? (this.agent.name || "custom agent") + " \u2014 " + target
 			: "the default Notion AI assistant";
 		this.agentBtn.classList.toggle("solid", custom);
 	};
@@ -397,7 +399,7 @@
 			rows.innerHTML = chats.map((chat) =>
 				'<div class="row">' +
 				'<button class="btn" data-open="' + attr(chat.id) + '"' +
-				' title="' + attr(chat.id) + '">' +
+				' title="' + attr(chat.title || chat.id) + '">' +
 				esc(String(chat.title || "untitled").toUpperCase().slice(0, 44)) + "</button>" +
 				'<span class="muted">' + esc([ago(chat.updated),
 					(chat.messages || 0) + " MSG",
@@ -427,17 +429,29 @@
 		};
 
 		const renderWeb = (payload) => {
+			const fallback = String((payload && payload.agent_url) || "");
 			if (payload && payload.error) return empty(String(payload.error).toUpperCase());
 			const chats = (payload && payload.chats) || [];
 			if (!chats.length) {
 				return empty("NO CHATS IN NOTION FOR THE SELECTED AGENT YET");
 			}
-			// These live in Notion, so there is nothing here to open locally.
+			// These transcripts live in Notion, so a row cannot be replayed here -
+			// but it is still a link, so it is a button and it opens Notion.
 			rows.innerHTML = chats.map((chat) =>
-				'<div class="row"><span>' +
-				esc(String(chat.title || "untitled").toUpperCase().slice(0, 44)) + "</span>" +
+				'<div class="row">' +
+				'<button class="btn" data-web="' + attr(chat.url || fallback) + '"' +
+				' title="' + attr(chat.title || chat.id) + '">' +
+				esc(String(chat.title || "untitled").toUpperCase().slice(0, 44)) + "</button>" +
 				'<span class="muted">' + esc(ago(chat.updated)) + "</span></div>").join("");
-			say("kept in notion only - open them in notion itself");
+			rows.querySelectorAll("button[data-web]").forEach((button) => {
+				button.onclick = () => {
+					const target = button.dataset.web;
+					if (!target) return say("no link for this chat");
+					window.open(target, "_blank", "noopener");
+					say("opened notion - the transcript is on the agent's page");
+				};
+			});
+			say("kept in notion only - a click opens the agent there");
 		};
 
 		const renderClaude = (payload) => {
@@ -522,10 +536,21 @@
 		let record;
 		try {
 			const response = await fetch("/api/chat/session?id=" + encodeURIComponent(id));
-			if (!response.ok) throw new Error("HTTP " + response.status);
+			if (!response.ok) {
+				// The server explains itself in the body ("no such chat: <path>",
+				// "unreadable chat: \u2026"). A bare status code would send the user
+				// hunting for something the answer already contains.
+				let reason = "HTTP " + response.status;
+				try {
+					const body = await response.json();
+					if (body && body.error) reason = String(body.error);
+				} catch (parseError) { /* not json: keep the status */ }
+				throw new Error(reason);
+			}
 			record = await response.json();
 		} catch (err) {
-			return this.el("notice", "COULD NOT OPEN THAT CHAT: " + esc(err.message));
+			return this.el("notice", "COULD NOT OPEN THAT CHAT: " +
+				esc(String(err.message).toUpperCase()));
 		}
 		this.historyCard = null;
 		this.log.innerHTML = "";
