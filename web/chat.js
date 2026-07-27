@@ -1,10 +1,33 @@
-/* Agent panel: SSE client for /api/chat, activity log, approval prompts. */
+/* Agent panel: SSE client for /api/chat, activity log, approval prompts.
+ *
+ * The panel also owns the "who answers" switch: the default Notion AI assistant
+ * or one of the user's own agents. Agents are workspace-local, so the only way
+ * to know one is to have the user paste its link - nothing about it can be
+ * shipped in the source.
+ */
 
 (function (global) {
 	"use strict";
 
 	const esc = (s) => String(s == null ? "" : s)
 		.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+	/* esc() is for text nodes; attribute values also need the quotes gone */
+	const attr = (s) => esc(s).replace(/"/g, "&quot;");
+
+	const UUID = /[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}/g;
+
+	/* Pull the agent id out of a pasted link. Accepts a full notion.so url, a
+	 * dashed uuid or a dashless one; answers "" when there is no id at all. */
+	function agentIdFromUrl(raw) {
+		const text = String(raw || "").split("?")[0].split("#")[0];
+		const found = text.match(UUID);
+		if (!found) return "";
+		const digits = found[found.length - 1].replace(/[^0-9a-fA-F]/g, "").toLowerCase();
+		if (digits.length !== 32) return "";
+		return [digits.slice(0, 8), digits.slice(8, 12), digits.slice(12, 16),
+			digits.slice(16, 20), digits.slice(20)].join("-");
+	}
 
 	/* very small markdown: fenced code, inline code, bold, bullets */
 	function md(text) {
@@ -33,6 +56,9 @@
 		this.controller = null;
 		this.current = null;
 		this.acts = {};
+		this.agent = { mode: "notion", url: "", name: "" };
+		this.agentCard = null;
+		this.initAgent();
 	}
 
 	Chat.prototype.el = function (cls, html) {
@@ -42,6 +68,148 @@
 		this.log.appendChild(node);
 		this.log.scrollTop = this.log.scrollHeight;
 		return node;
+	};
+
+	/* -- which assistant answers ------------------------------------------ */
+
+	Chat.prototype.initAgent = function () {
+		this.agentBtn = document.getElementById("btn-agent");
+		if (!this.agentBtn) return;
+		this.agentBtn.onclick = () => this.pickAgent();
+		this.loadAgent();
+	};
+
+	Chat.prototype.loadAgent = async function () {
+		try {
+			const state = await (await fetch("/api/state")).json();
+			const up = ((state || {}).config || {}).upstream || {};
+			const custom = String(up.agent_mode || "notion").toLowerCase() === "custom";
+			this.agent = {
+				mode: custom ? "custom" : "notion",
+				url: String(up.agent_url || ""),
+				name: String(up.agent_name || ""),
+			};
+		} catch (err) {
+			/* keep the default; the button just shows NOTION AI */
+		}
+		this.paintAgent();
+	};
+
+	Chat.prototype.paintAgent = function () {
+		if (!this.agentBtn) return;
+		const custom = this.agent.mode === "custom" && this.agent.url;
+		const label = custom ? (this.agent.name || "CUSTOM AGENT") : "NOTION AI";
+		this.agentBtn.textContent = "AGENT: " + String(label).toUpperCase().slice(0, 22);
+		this.agentBtn.title = custom
+			? "custom agent: " + this.agent.url
+			: "the default Notion AI assistant";
+		this.agentBtn.classList.toggle("solid", !!custom);
+	};
+
+	Chat.prototype.pickAgent = function () {
+		if (this.agentCard) {
+			this.agentCard.remove();
+			this.agentCard = null;
+		}
+		let mode = this.agent.mode;
+		const node = this.el("ask",
+			'<div class="q">WHO ANSWERS IN THIS IDE?</div>' +
+			'<div class="row">' +
+			'<button class="btn" data-m="notion">NOTION AI</button>' +
+			'<button class="btn" data-m="custom">MY CUSTOM AGENT</button>' +
+			"</div>" +
+			'<div id="agent-fields">' +
+			'<div class="row"><input class="in" id="agent-link" autocomplete="off"' +
+			' placeholder="PASTE THE AGENT LINK (NOTION.SO/…)" value="' + attr(this.agent.url) + '"></div>' +
+			'<div class="row"><input class="in" id="agent-name" autocomplete="off"' +
+			' placeholder="LABEL FOR THE BUTTON (OPTIONAL)" value="' + attr(this.agent.name) + '"></div>' +
+			"</div>" +
+			'<div class="row">' +
+			'<button class="btn solid" data-a="save">SAVE</button>' +
+			'<button class="btn" data-a="cancel">CANCEL</button>' +
+			"</div>" +
+			'<div class="muted" id="agent-hint">OPEN THE AGENT IN NOTION AND COPY ITS LINK — ' +
+			"AN AGENT ONLY EXISTS IN THE WORKSPACE THAT OWNS IT</div>");
+		this.agentCard = node;
+
+		const fields = node.querySelector("#agent-fields");
+		const hint = node.querySelector("#agent-hint");
+		const link = node.querySelector("#agent-link");
+		const name = node.querySelector("#agent-name");
+		const modeButtons = node.querySelectorAll("button[data-m]");
+
+		const paint = () => {
+			fields.style.display = mode === "custom" ? "" : "none";
+			modeButtons.forEach((button) =>
+				button.classList.toggle("solid", button.dataset.m === mode));
+		};
+		modeButtons.forEach((button) => {
+			button.onclick = () => {
+				mode = button.dataset.m;
+				paint();
+				if (mode === "custom") link.focus();
+			};
+		});
+		paint();
+
+		const close = () => {
+			node.remove();
+			this.agentCard = null;
+		};
+
+		const save = async () => {
+			const url = link.value.trim();
+			const label = name.value.trim();
+			let agentId = "";
+			if (mode === "custom") {
+				agentId = agentIdFromUrl(url);
+				if (!agentId) {
+					hint.textContent = url
+						? "NO AGENT ID IN THAT LINK — IT SHOULD CONTAIN A 32-CHARACTER ID"
+						: "PASTE THE LINK TO YOUR AGENT FIRST";
+					link.focus();
+					return;
+				}
+			}
+			try {
+				const response = await fetch("/api/config", {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({
+						set: {
+							"upstream.agent_mode": mode,
+							"upstream.agent_url": mode === "custom" ? url : "",
+							"upstream.agent_id": agentId,
+							"upstream.agent_name": mode === "custom" ? label : "",
+						},
+					}),
+				});
+				if (!response.ok) throw new Error("HTTP " + response.status);
+			} catch (err) {
+				hint.textContent = "COULD NOT SAVE: " + String(err.message).toUpperCase();
+				return;
+			}
+			this.agent = {
+				mode,
+				url: mode === "custom" ? url : "",
+				name: mode === "custom" ? label : "",
+			};
+			this.paintAgent();
+			close();
+			// the bound Notion thread belongs to the previous assistant, so the
+			// backend starts a fresh chat on the next message by itself
+			this.el("notice", mode === "custom"
+				? "CUSTOM AGENT SELECTED — A NEW NOTION CHAT STARTS WITH THE NEXT MESSAGE"
+				: "BACK TO THE DEFAULT NOTION AI ASSISTANT");
+		};
+
+		node.querySelector('button[data-a="save"]').onclick = save;
+		node.querySelector('button[data-a="cancel"]').onclick = close;
+		link.onkeydown = (event) => {
+			if (event.key === "Enter") { event.preventDefault(); save(); }
+		};
+		name.onkeydown = link.onkeydown;
+		if (mode === "custom") link.focus();
 	};
 
 	Chat.prototype.setBusy = function (busy, label) {
@@ -60,6 +228,7 @@
 			});
 		}
 		this.session = null;
+		this.agentCard = null;
 		this.log.innerHTML = "";
 		this.el("notice", "NEW SESSION — BRIDGE PREAMBLE WILL BE RESENT");
 	};
@@ -249,4 +418,5 @@
 
 	global.Chat = Chat;
 	global.mdRender = md;
+	global.agentIdFromUrl = agentIdFromUrl;
 })(window);

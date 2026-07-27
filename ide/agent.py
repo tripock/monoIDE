@@ -28,6 +28,15 @@ sqlite sliding window and forwards only the LAST message of the request
 (conversation.get_transcript_payload(new_prompt=...)). Anything we put earlier
 in the list - including the runner preamble - is dropped. _payload_messages()
 therefore folds the preamble into the outgoing last user message.
+
+Notion AI or a custom agent
+---------------------------
+The user can point the chat at one of their own Notion agents instead of the
+default assistant. The choice lives in the config (upstream.agent_mode /
+agent_url) and is published to the notion2api process before every turn by
+config.write_agent_target(); the request headers carry it as well. Switching
+agents mid-session drops the bound conversation id, because a Notion thread
+belongs to the assistant that created it.
 """
 
 from __future__ import annotations
@@ -43,7 +52,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from . import prompts, tools as tools_mod
-from .config import describe_environment
+from .config import describe_environment, read_agent_selection, write_agent_target
 from .tools import ApprovalRequired, ToolContext, ToolError
 
 ACTION_BLOCK = re.compile(r"```(?:action|tool|json:action)\s*\n(.*?)```", re.DOTALL)
@@ -88,6 +97,13 @@ class Upstream:
         key = self.config.get("upstream", "api_key", default="")
         if key:
             headers["Authorization"] = f"Bearer {key}"
+        # which assistant should answer; the bundled notion2api also reads this
+        # from the shared state file, the headers make it visible in its logs
+        agent = read_agent_selection(self.config)
+        if agent["agent_id"]:
+            headers["X-Notion-Agent-Id"] = agent["agent_id"]
+            if agent["agent_url"]:
+                headers["X-Notion-Agent-Url"] = agent["agent_url"]
         return headers
 
     def models(self) -> List[str]:
@@ -250,6 +266,8 @@ class Session:
         self.updated = time.time()
         # notion2api conversation id: the whole session maps to one Notion chat
         self.conversation_id = ""
+        # agent the bound conversation belongs to ("" = the default assistant)
+        self.agent_key = ""
         self.lock = threading.Lock()
         self._decision: Optional[str] = None
         self._decision_event = threading.Event()
@@ -352,6 +370,27 @@ class Session:
         merged = f"{preamble}\n\n---\n\n{last['content']}"
         return messages[:-1] + [{"role": "user", "content": merged}]
 
+    # -- assistant selection ----------------------------------------------
+    def _sync_agent(self, emit: Callable[[str, Dict[str, Any]], None]) -> None:
+        """Hand the picked assistant to notion2api and react to a switch.
+
+        Done once per turn, so choosing another agent in the UI takes effect on
+        the next message with no restart. A Notion thread belongs to whichever
+        assistant created it, so a switch also means starting a new chat.
+        """
+        agent_key = write_agent_target(self.config)
+        if agent_key == self.agent_key:
+            return
+        previous = self.agent_key
+        self.agent_key = agent_key
+        self.conversation_id = ""
+        if not previous and not self.messages[1:]:
+            # first turn of the session: nothing to announce
+            return
+        selection = read_agent_selection(self.config)
+        target = selection["agent_name"] if agent_key else "the default Notion AI assistant"
+        emit("notice", {"text": f"switched to {target}; a new Notion chat starts now"})
+
     # -- main loop ---------------------------------------------------------
     def run(self, user_text: str, *, attachments: Optional[List[str]] = None,
             emit: Callable[[str, Dict[str, Any]], None]) -> None:
@@ -367,6 +406,7 @@ class Session:
     def _run(self, user_text: str, attachments: List[str],
              emit: Callable[[str, Dict[str, Any]], None]) -> None:
         self._ensure_preamble()
+        self._sync_agent(emit)
         if not self.title:
             self.title = user_text.strip().splitlines()[0][:60] if user_text.strip() else "session"
 
