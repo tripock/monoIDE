@@ -1,22 +1,42 @@
 """Send requests to a custom Notion agent instead of the default assistant.
 
-Why this file exists
---------------------
-notion2api always talks to the default Notion assistant: the config block it
-puts at the top of every transcript carries ``isCustomAgent: False``. monoIDE
-lets the user paste a link to one of their own agents, and a custom agent only
-exists inside the workspace that owns it, so no id can ever be baked into the
-source.
+What Notion actually wants
+--------------------------
+A captured browser request to a custom agent shows two things, and one alone is
+not enough - with only the first, the default assistant answers:
 
-monoIDE writes the picked agent into a small json file (``ide/config.py``,
-``write_agent_target``). Every transcript built in this process is walked and,
-when a custom agent is selected, the config block is rewritten to point at it.
-When the file is missing or says ``notion``, nothing is touched at all and the
-behaviour is exactly what it was before.
+1. the config step of the transcript::
 
-The hook is installed from ``app/api/__init__.py`` - that runs before
-``app.api.chat`` copies the transcript builders into its own namespace, which is
-the only moment where patching them still has an effect.
+     {"type": "workflow", "model": "agave-flan",
+      "workflowId": "3a14797c-...-9bb113bd",
+      "isCustomAgent": true, "useCustomAgentDraft": true,
+      "enableCustomAgents": true, ...}
+
+2. the thread the answer is written into is parented by that workflow::
+
+     "threadParentPointer": {"table": "workflow", "id": "3a14797c-...", ...}
+
+   (the resulting thread record carries parent_table "workflow",
+   data.workflow_id = the same id and created_source "custom_agent")
+
+So a custom agent is a *workflow* record: its id belongs in ``workflowId``, and
+there is no "agentId" field at all. notion2api hardcodes
+``isCustomAgent: False`` and parents every thread to the space, which is exactly
+why the default assistant answers.
+
+How the choice gets here
+------------------------
+monoIDE writes it into a small json file (``ide/config.py``,
+``write_agent_target``); an agent only exists in the workspace that owns it, so
+nothing can be baked into the source. Two hooks are installed from
+``app/api/__init__.py``:
+
+* the transcript builders, so every config block carries the workflow id;
+* ``cloudscraper.create_scraper``, so the outgoing runInferenceTranscript
+  payload gets the workflow thread parent - that payload is a local variable
+  inside ``notion_client.stream_response`` and the transport is the only seam.
+
+With the file missing or set to "notion", nothing is touched at all.
 """
 
 from __future__ import annotations
@@ -31,8 +51,11 @@ from pathlib import Path
 from typing import Any, Dict
 
 TARGET_FILENAME = "agent-target.json"
-# the file is read at most this often; the IDE may rewrite it between messages
+# the file is re-read at most this often; the IDE rewrites it between messages
 CACHE_SECONDS = 1.0
+
+# the dict that carries this key is the transcript's config block
+CONFIG_MARKER = "isCustomAgent"
 
 _UUID = re.compile(
     r"[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}"
@@ -104,11 +127,15 @@ def current_agent() -> Dict[str, str]:
 
 
 def apply_to(payload: Any, agent: Dict[str, str]) -> int:
-    """Rewrite every config block inside ``payload`` to target the agent.
+    """Point every config block inside ``payload`` at the custom agent.
 
-    The walk is deliberately shape-agnostic: lite, standard and heavy mode all
-    build their transcripts differently, but each of them contains exactly the
-    dict that carries ``isCustomAgent``.
+    The walk is shape-agnostic on purpose: lite, standard and heavy mode each
+    build their transcript differently, but all of them contain the one dict
+    that carries ``isCustomAgent``.
+
+    ``type`` is left alone. Heavy mode already uses "workflow", which is what a
+    custom agent needs, while forcing it in markdown-chat mode would break the
+    Gemini models that depend on that thread type.
     """
     agent_id = agent.get("id") or ""
     if not agent_id:
@@ -122,15 +149,35 @@ def apply_to(payload: Any, agent: Dict[str, str]) -> int:
             if id(node) in seen:
                 continue
             seen.add(id(node))
-            if "isCustomAgent" in node:
+            if CONFIG_MARKER in node:
                 node["isCustomAgent"] = True
                 node["enableCustomAgents"] = True
-                node["agentId"] = agent_id
+                node["useCustomAgentDraft"] = True
+                node["workflowId"] = agent_id
+                # never existed; an early guess of ours, kept out of the payload
+                node.pop("agentId", None)
                 patched += 1
             stack.extend(node.values())
         elif isinstance(node, (list, tuple)):
             stack.extend(node)
     return patched
+
+
+def retarget_request(payload: Dict[str, Any], agent: Dict[str, str]) -> None:
+    """Make a runInferenceTranscript payload belong to the custom agent.
+
+    Without the workflow thread parent Notion accepts the request happily and
+    answers with the default assistant, so this half is not optional.
+    """
+    agent_id = agent.get("id") or ""
+    if not agent_id:
+        return
+    payload["threadParentPointer"] = {
+        "table": "workflow",
+        "id": agent_id,
+        "spaceId": payload.get("spaceId"),
+    }
+    apply_to(payload.get("transcript"), agent)
 
 
 def _log(message: str, **fields: Any) -> None:
@@ -142,6 +189,10 @@ def _log(message: str, **fields: Any) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# hook 1: transcript builders
+# ---------------------------------------------------------------------------
+
 def _wrap_builder(builder):
     def hook(*args: Any, **kwargs: Any):
         transcript = builder(*args, **kwargs)
@@ -149,10 +200,10 @@ def _wrap_builder(builder):
         if agent:
             patched = apply_to(transcript, agent)
             _log(
-                "Transcript routed to a custom agent",
-                event="custom_agent_applied",
+                "Transcript config pointed at a custom agent",
+                event="custom_agent_transcript",
                 builder=getattr(builder, "__name__", "builder"),
-                agent_id=agent["id"],
+                workflow_id=agent["id"],
                 blocks_patched=patched,
             )
         return transcript
@@ -162,13 +213,7 @@ def _wrap_builder(builder):
     return hook
 
 
-def install() -> None:
-    """Wrap the transcript builders. Safe to call more than once."""
-    global _installed
-    if _installed:
-        return
-    _installed = True
-
+def _install_builders() -> None:
     from app import conversation as conv
 
     manager = getattr(conv, "ConversationManager", None)
@@ -177,18 +222,18 @@ def install() -> None:
         if not getattr(original, "_agent_hook", False):
 
             def payload_hook(self, *args: Any, **kwargs: Any):
-                payload = original(self, *args, **kwargs)
+                result = original(self, *args, **kwargs)
                 agent = current_agent()
-                if agent and isinstance(payload, dict):
-                    patched = apply_to(payload.get("transcript"), agent)
+                if agent and isinstance(result, dict):
+                    patched = apply_to(result.get("transcript"), agent)
                     _log(
-                        "Transcript routed to a custom agent",
-                        event="custom_agent_applied",
+                        "Transcript config pointed at a custom agent",
+                        event="custom_agent_transcript",
                         builder="get_transcript_payload",
-                        agent_id=agent["id"],
+                        workflow_id=agent["id"],
                         blocks_patched=patched,
                     )
-                return payload
+                return result
 
             payload_hook._agent_hook = True  # type: ignore[attr-defined]
             manager.get_transcript_payload = payload_hook
@@ -198,3 +243,63 @@ def install() -> None:
         if builder is None or getattr(builder, "_agent_hook", False):
             continue
         setattr(conv, name, _wrap_builder(builder))
+
+
+# ---------------------------------------------------------------------------
+# hook 2: the outgoing request
+# ---------------------------------------------------------------------------
+
+class _AgentAwareScraper:
+    """Pass-through proxy that retargets runInferenceTranscript payloads.
+
+    Everything except ``post`` is forwarded untouched, and ``post`` only edits
+    the payload while a custom agent is selected.
+    """
+
+    def __init__(self, inner: Any):
+        self._inner = inner
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def post(self, *args: Any, **kwargs: Any):
+        payload = kwargs.get("json")
+        if isinstance(payload, dict) and "transcript" in payload:
+            agent = current_agent()
+            if agent:
+                retarget_request(payload, agent)
+                _log(
+                    "Request retargeted to a custom agent workflow",
+                    event="custom_agent_request",
+                    workflow_id=agent["id"],
+                    thread_id=payload.get("threadId"),
+                    thread_type=payload.get("threadType"),
+                    create_thread=payload.get("createThread"),
+                )
+        return self._inner.post(*args, **kwargs)
+
+
+def _install_transport() -> None:
+    import cloudscraper
+
+    original = cloudscraper.create_scraper
+    if getattr(original, "_agent_hook", False):
+        return
+
+    def create_scraper_hook(*args: Any, **kwargs: Any):
+        return _AgentAwareScraper(original(*args, **kwargs))
+
+    create_scraper_hook._agent_hook = True  # type: ignore[attr-defined]
+    # notion_client calls cloudscraper.create_scraper() lazily - at init and
+    # again when a 403 forces a rebuild - so both paths get the proxy
+    cloudscraper.create_scraper = create_scraper_hook
+
+
+def install() -> None:
+    """Install both hooks. Safe to call more than once."""
+    global _installed
+    if _installed:
+        return
+    _installed = True
+    _install_builders()
+    _install_transport()
