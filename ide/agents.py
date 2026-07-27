@@ -15,8 +15,9 @@ Everything below was confirmed against real traffic - no guessed endpoints:
   ``data.status``, ``data.modules``.
 * ``POST /api/v3/getWorkflowCreditUsage`` with ``{spaceId, workflowId}`` answers
   ``{creditUsage, trialEstimatedCreditUsage}`` - a cheap existence check.
-* ``POST /api/v3/getInferenceTranscriptsForWorkflow`` returns an agent's chats
-  (kept for the chat-history work, not used here).
+* ``POST /api/v3/getInferenceTranscriptsForWorkflow`` returns an agent's chats.
+  Only the call was observed, never its response body, so ``recent_chats``
+  parses it shape-tolerantly and falls back to the transcripts above.
 
 All of it rides on the cookie of the account the IDE already signed in with, so
 nothing agent-specific is ever hardcoded: an agent only exists inside the
@@ -231,6 +232,103 @@ def list_agents(account: Dict[str, Any]) -> List[Dict[str, Any]]:
     return rows
 
 
+# ---------------------------------------------------------------------------
+# an agent's chats, as Notion keeps them
+# ---------------------------------------------------------------------------
+
+def _transcript_row(raw: Any, agent_id: str) -> Optional[Dict[str, Any]]:
+    """One chat entry, or None when the dict is not a transcript."""
+    if not isinstance(raw, dict):
+        return None
+    # transcripts nest under {value: {...}} in some responses and are flat in
+    # others, so unwrap before looking for the fields
+    record = _unwrap(raw)
+    thread_id = str(record.get("id") or "")
+    if not thread_id:
+        return None
+
+    def stamp(*names: str) -> int:
+        for name in names:
+            try:
+                value = int(record.get(name) or 0)
+            except (TypeError, ValueError):
+                continue
+            if value:
+                return value
+        return 0
+
+    data = record.get("data")
+    data = data if isinstance(data, dict) else {}
+    return {
+        "id": thread_id,
+        "title": str(record.get("title") or data.get("title") or "").strip() or "untitled chat",
+        "created": stamp("created_time"),
+        "updated": stamp("updated_time", "last_edited_time", "created_time"),
+        "storage": "web",
+        "source": str(record.get("created_source") or ""),
+        "agent": {"id": agent_id},
+        "messages": 0,
+    }
+
+
+def _harvest(node: Any, agent_id: str, out: Dict[str, Dict[str, Any]], depth: int = 0) -> None:
+    """Collect transcript-looking dicts from an unknown response shape.
+
+    Only the endpoint name was ever observed, so the walk stays agnostic about
+    where in the payload the list lives instead of betting on a key.
+    """
+    if depth > 6:
+        return
+    if isinstance(node, dict):
+        row = _transcript_row(node, agent_id)
+        if row is not None and ("title" in node or "created_time" in node):
+            out.setdefault(row["id"], row)
+            return
+        for value in node.values():
+            _harvest(value, agent_id, out, depth + 1)
+    elif isinstance(node, list):
+        for value in node:
+            _harvest(value, agent_id, out, depth + 1)
+
+
+def recent_chats(account: Dict[str, Any], agent_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+    """Chats Notion holds for one agent, newest first.
+
+    Tries the endpoint the web app uses for exactly this, then falls back to the
+    transcripts getCustomAgents hands out - fewer entries, but a verified shape.
+    """
+    ident = agent_id_from(agent_id) or str(agent_id or "")
+    if not ident:
+        raise AgentError("no agent id to list chats for")
+    space_id = str(account.get("space_id") or "")
+    found: Dict[str, Dict[str, Any]] = {}
+
+    try:
+        payload = _post(
+            "getInferenceTranscriptsForWorkflow",
+            {"spaceId": space_id, "workflowId": ident},
+            account,
+        )
+        _harvest(payload, ident, found)
+    except AgentError:
+        # 404 or a changed contract: the fallback below still answers
+        pass
+
+    if not found:
+        payload = _post("getCustomAgents", {"spaceId": space_id}, account)
+        for transcript in payload.get("mostRecentTranscripts") or []:
+            if not isinstance(transcript, dict):
+                continue
+            if str(transcript.get("parent_id") or "") != ident:
+                continue
+            row = _transcript_row(transcript, ident)
+            if row is not None:
+                found.setdefault(row["id"], row)
+
+    rows = sorted(found.values(), key=lambda row: row["updated"], reverse=True)
+    return rows[: max(1, limit)]
+
+
 def credit_usage(account: Dict[str, Any], agent_id: str) -> Optional[int]:
     try:
         payload = _post(
@@ -282,12 +380,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="list or check custom Notion agents")
     parser.add_argument("agent", nargs="?", default="", help="agent link or id to check")
     parser.add_argument("--workspace", default=".", help="project folder holding .monoide")
+    parser.add_argument("--chats", action="store_true", help="list that agent's Notion chats")
     parser.add_argument("--json", action="store_true", help="machine-readable output")
     args = parser.parse_args(argv)
 
     try:
         account = load_account(Path(args.workspace).expanduser().resolve())
-        if args.agent:
+        if args.agent and args.chats:
+            result = {"chats": recent_chats(account, args.agent)}
+        elif args.agent:
             result = verify(account, args.agent)
         else:
             result = {"agents": list_agents(account)}
@@ -297,6 +398,15 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+
+    if "chats" in result:
+        rows = result["chats"]
+        if not rows:
+            print("no chats found for that agent")
+            return 0
+        for row in rows:
+            print("%s  %s" % (row["id"], row["title"]))
         return 0
 
     if args.agent:
