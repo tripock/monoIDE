@@ -21,8 +21,14 @@ DEFAULTS: Dict[str, Any] = {
         "embedded": True,
         # preferred port for it; the next free one is used when taken
         "embedded_port": 8000,
-        # notion2api APP_MODE: standard keeps full context + thinking
-        "app_mode": "standard",
+        # notion2api APP_MODE. "heavy" is the only mode that binds a Notion
+        # thread to a conversation_id; lite and standard call Notion with
+        # thread_id=None, which means every single request of the agent loop
+        # opens a new chat in Notion (~10 chats per user message).
+        "app_mode": "heavy",
+        # keep one Notion chat per IDE chat session by replaying the
+        # conversation_id notion2api returns in X-Conversation-Id
+        "reuse_conversation": True,
         "api_key": "",
         "model": "claude-sonnet4.6",
         "stream": True,
@@ -116,10 +122,16 @@ class Config:
                 data = _deep_merge(DEFAULTS, json.loads(cfg_path.read_text("utf-8")))
             except Exception:
                 pass
+        # Older configs were written with app_mode "standard" or "lite", both of
+        # which make Notion open a fresh chat on every request of the agent
+        # loop. Nobody picks that on purpose, so migrate it away.
+        if str(data.get("upstream", {}).get("app_mode", "")).lower() in ("standard", "lite"):
+            data["upstream"]["app_mode"] = "heavy"
         # environment overrides (handy for docker / quick runs)
         env_base = os.environ.get("MONOIDE_BASE_URL")
         env_key = os.environ.get("MONOIDE_API_KEY")
         env_model = os.environ.get("MONOIDE_MODEL")
+        env_mode = os.environ.get("MONOIDE_APP_MODE")
         if env_base:
             data["upstream"]["base_url"] = env_base
             # an explicit base url means "use my own notion2api"
@@ -128,6 +140,8 @@ class Config:
             data["upstream"]["api_key"] = env_key
         if env_model:
             data["upstream"]["model"] = env_model
+        if env_mode:
+            data["upstream"]["app_mode"] = env_mode
         return cls(root=root_path, data=data)
 
     def save(self) -> None:

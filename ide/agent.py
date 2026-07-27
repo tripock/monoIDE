@@ -13,6 +13,15 @@ Event kinds:
   status      {text}
   done        {rounds}
   error       {message}
+
+One IDE session = one Notion chat
+---------------------------------
+Every round of the loop is a separate HTTP request to notion2api. notion2api
+only keeps a Notion thread alive across requests in "heavy" app mode, and only
+when the caller replays the conversation_id it handed out in the
+X-Conversation-Id response header. Without that, one user message turns into a
+dozen chats in Notion - one per tool round. Upstream therefore remembers the
+conversation id and Session feeds it back on every round.
 """
 
 from __future__ import annotations
@@ -33,6 +42,19 @@ from .tools import ApprovalRequired, ToolContext, ToolError
 
 ACTION_BLOCK = re.compile(r"```(?:action|tool|json:action)\s*\n(.*?)```", re.DOTALL)
 
+# notion2api appends its web-search footer as markdown quote lines when it
+# thinks the client cannot render metadata ("> 🔍 已搜索" / "> 🌐 来源:").
+# We ask for the rich protocol instead, but old replies and other upstreams can
+# still carry it, so strip it defensively.
+SOURCE_FOOTER = re.compile(r"(?m)^[ \t]*>[ \t]*(?:🌐|🔍)[^\n]*\n?")
+SOURCE_FOOTER_ITEM = re.compile(r"(?m)^[ \t]*>[ \t]*\d+\.[ \t]*\[[^\]]*\]\([^)]*\)[ \t]*\n?")
+
+
+def strip_source_footer(text: str) -> str:
+    cleaned = SOURCE_FOOTER.sub("", text or "")
+    cleaned = SOURCE_FOOTER_ITEM.sub("", cleaned)
+    return cleaned
+
 
 # ---------------------------------------------------------------------------
 # upstream (notion2api, OpenAI-compatible)
@@ -41,13 +63,22 @@ ACTION_BLOCK = re.compile(r"```(?:action|tool|json:action)\s*\n(.*?)```", re.DOT
 class Upstream:
     def __init__(self, config):
         self.config = config
+        # filled from the X-Conversation-Id response header; replayed on the
+        # next request so Notion keeps writing into the same chat
+        self.conversation_id = ""
 
     def _url(self, suffix: str) -> str:
         base = str(self.config.get("upstream", "base_url", default="")).rstrip("/")
         return f"{base}/{suffix.lstrip('/')}"
 
     def _headers(self) -> Dict[str, str]:
-        headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+            # we understand notion2api's rich events, so it must not inline the
+            # "🌐 来源" markdown footer into the assistant's answer
+            "X-Client-Type": "web",
+        }
         key = self.config.get("upstream", "api_key", default="")
         if key:
             headers["Authorization"] = f"Bearer {key}"
@@ -62,13 +93,18 @@ class Upstream:
             return []
         return [item.get("id") for item in payload.get("data", []) if item.get("id")]
 
-    def stream(self, messages: List[Dict[str, str]], model: str) -> Iterator[Dict[str, str]]:
-        """Yield {'type': 'content'|'thinking', 'text': ...} chunks."""
-        body = json.dumps({
+    def stream(self, messages: List[Dict[str, str]], model: str,
+               conversation_id: str = "") -> Iterator[Dict[str, str]]:
+        """Yield {'type': 'content'|'thinking'|'replace', 'text': ...} chunks."""
+        payload: Dict[str, Any] = {
             "model": model,
             "messages": messages,
             "stream": bool(self.config.get("upstream", "stream", default=True)),
-        }).encode("utf-8")
+        }
+        reuse = bool(self.config.get("upstream", "reuse_conversation", default=True))
+        if reuse and conversation_id:
+            payload["conversation_id"] = conversation_id
+        body = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
             self._url("chat/completions"), data=body, headers=self._headers(), method="POST"
         )
@@ -81,12 +117,18 @@ class Upstream:
         except Exception as exc:
             raise RuntimeError(f"cannot reach notion2api at {self._url('chat/completions')}: {exc}")
 
+        # heavy mode answers with the conversation it used; remember it even
+        # when it differs from what we asked for (expired / unknown ids)
+        handed_out = response.headers.get("X-Conversation-Id") or ""
+        if handed_out:
+            self.conversation_id = handed_out
+
         content_type = response.headers.get("Content-Type", "")
         if "text/event-stream" not in content_type:
-            payload = json.loads(response.read().decode("utf-8", "replace"))
-            if payload.get("error"):
-                raise RuntimeError(str(payload["error"]))
-            text = payload["choices"][0]["message"].get("content") or ""
+            payload_json = json.loads(response.read().decode("utf-8", "replace"))
+            if payload_json.get("error"):
+                raise RuntimeError(str(payload_json["error"]))
+            text = payload_json["choices"][0]["message"].get("content") or ""
             yield {"type": "content", "text": text}
             return
 
@@ -103,6 +145,22 @@ class Upstream:
                 continue
             if chunk.get("error"):
                 raise RuntimeError(str(chunk["error"]))
+
+            # notion2api's own event types (sent because of X-Client-Type: web)
+            event = str(chunk.get("type") or "")
+            if event == "thinking_chunk":
+                text = chunk.get("text") or ""
+                if text:
+                    yield {"type": "thinking", "text": text}
+                continue
+            if event == "content_replace":
+                yield {"type": "replace", "text": chunk.get("content") or ""}
+                continue
+            if event in ("search_metadata", "thinking_replace"):
+                # search sources and rewritten reasoning are UI sugar we do not
+                # want inside the transcript the agent reasons over
+                continue
+
             for choice in chunk.get("choices") or []:
                 delta = choice.get("delta") or {}
                 if delta.get("reasoning_content") or delta.get("thinking"):
@@ -183,6 +241,9 @@ class Session:
         self.approvals: set = set()
         self.title = ""
         self.created = time.time()
+        self.updated = time.time()
+        # notion2api conversation id: the whole session maps to one Notion chat
+        self.conversation_id = ""
         self.lock = threading.Lock()
         self._decision: Optional[str] = None
         self._decision_event = threading.Event()
@@ -268,6 +329,7 @@ class Session:
             emit("error", {"message": str(exc)})
         finally:
             self.busy = False
+            self.updated = time.time()
 
     def _run(self, user_text: str, attachments: List[str],
              emit: Callable[[str, Dict[str, Any]], None]) -> None:
@@ -291,6 +353,7 @@ class Session:
 
         model = self.config.get("upstream", "model", default="claude-sonnet4.6")
         upstream = Upstream(self.config)
+        upstream.conversation_id = self.conversation_id
         max_rounds = int(self.config.get("agent", "max_rounds", default=24))
         repairs_left = int(self.config.get("agent", "max_repairs", default=2)) \
             if self.config.get("agent", "repair_refusals", default=True) else 0
@@ -309,13 +372,25 @@ class Session:
             self._trim()
             emit("status", {"text": f"round {round_index}"})
             assistant_text = ""
-            for chunk in upstream.stream(self.messages, model):
+            for chunk in upstream.stream(self.messages, model, self.conversation_id):
                 if chunk["type"] == "thinking":
                     emit("thinking", {"text": chunk["text"]})
+                    continue
+                if chunk["type"] == "replace":
+                    # notion2api decided its final answer diverged from what it
+                    # streamed; only useful when nothing was shown yet
+                    if not assistant_text.strip() and chunk["text"]:
+                        assistant_text = chunk["text"]
+                        emit("token", {"text": chunk["text"]})
                     continue
                 assistant_text += chunk["text"]
                 emit("token", {"text": chunk["text"]})
 
+            # one Notion chat per session: keep the id it answered with
+            if upstream.conversation_id and upstream.conversation_id != self.conversation_id:
+                self.conversation_id = upstream.conversation_id
+
+            assistant_text = strip_source_footer(assistant_text)
             actions = parse_actions(assistant_text)
 
             # Refusal repair: the model answered about itself instead of working.
