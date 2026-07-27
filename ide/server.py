@@ -601,6 +601,24 @@ class Handler(BaseHTTPRequestHandler):
                 ],
             })
 
+        # The agent picker. Talking to Notion takes a second or two, so this is a
+        # route of its own rather than a field of /api/state, which the UI polls.
+        if route == "/api/agents":
+            from .agents import AgentError, list_agents  # noqa: PLC0415
+
+            account = workspace.auth.account or {}
+            if not account.get("token_v2"):
+                return self._json({"agents": [], "error": "sign in to Notion first"})
+            try:
+                return self._json({
+                    "agents": list_agents(account),
+                    "space": account.get("space_name") or "",
+                })
+            except AgentError as exc:
+                # A missing agent list must never break the chat: the UI falls
+                # back to pasting a link.
+                return self._json({"agents": [], "error": str(exc)})
+
         if route == "/api/tree":
             return self._json({"entries": workspace.tree(first("path", "."))})
 
@@ -732,6 +750,19 @@ class Handler(BaseHTTPRequestHandler):
 
         if route == "/api/search":
             return self._json(_search(workspace, body))
+
+        # Manual fallback of the picker: resolve a pasted agent link into a real
+        # agent before the config remembers it.
+        if route == "/api/agents/verify":
+            from .agents import AgentError, verify as verify_agent  # noqa: PLC0415
+
+            account = workspace.auth.account or {}
+            if not account.get("token_v2"):
+                return self._json({"ok": False, "detail": "sign in to Notion first"})
+            try:
+                return self._json(verify_agent(account, str(body.get("agent") or "")))
+            except AgentError as exc:
+                return self._json({"ok": False, "detail": str(exc)})
 
         if route == "/api/lsp/diagnostics":
             path = workspace.safe(str(body.get("path")))
