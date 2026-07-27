@@ -11,6 +11,10 @@
  * only while the chat is still empty - once the first message is away the
  * transcript is already being written one way or the other, so the switch
  * pins itself and disappears.
+ *
+ * Reading a stored chat back is a separate job from streaming a live one, and a
+ * much heavier one: an agent session is thousands of entries, most of them
+ * pasted file contents. See openChat/showTranscript at the bottom.
  */
 
 (function (global) {
@@ -23,6 +27,12 @@
 	const attr = (s) => esc(s).replace(/"/g, "&quot;");
 
 	const UUID = /[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}/g;
+
+	/* How much of a stored transcript is put in the DOM at once, and how much of
+	 * one entry. Both exist for the same reason: a real agent session carries
+	 * whole files, and "render everything" means a frozen window. */
+	const TRANSCRIPT_PAGE = 200;
+	const BODY_CLIP = 8000;
 
 	/* Pull the agent id out of a pasted link. Accepts a full notion.so url, a
 	 * dashed uuid or a dashless one; answers "" when there is no id at all. */
@@ -63,6 +73,87 @@
 		return out.replace(/\u0000(\d+)\u0000/g, (m, i) => blocks[+i]);
 	}
 
+	/* -- naming the parts of a transcript --------------------------------- *
+	 * Tool names come from two worlds: this IDE (read_file, mcp_call) and
+	 * Claude Code imports (Read, MultiEdit, mcp__server__tool). Both are mapped
+	 * onto the same short nouns so a transcript reads the same either way. */
+	const TOOL_NOUNS = {
+		read_file: "READ FILE", read: "READ FILE",
+		write_file: "WRITE FILE", write: "WRITE FILE", notebookedit: "WRITE FILE",
+		edit_file: "EDIT FILE", edit: "EDIT FILE", multiedit: "EDIT FILE",
+		list_dir: "FOLDER LISTING", ls: "FOLDER LISTING",
+		grep: "SEARCH", glob: "SEARCH",
+		websearch: "WEB SEARCH", webfetch: "WEB FETCH",
+		bash: "COMMAND", bashoutput: "COMMAND", killshell: "COMMAND",
+		mcp_call: "MCP", mcp_list: "MCP TOOLS",
+		todowrite: "TODO LIST", task: "SUBTASK", exitplanmode: "PLAN",
+	};
+
+	function toolNoun(name) {
+		const key = String(name || "").trim().toLowerCase();
+		if (!key) return "";
+		if (key.indexOf("mcp__") === 0) return "MCP";
+		return TOOL_NOUNS[key] || key.toUpperCase().slice(0, 24);
+	}
+
+	/* a stored entry may name several tools: "read_file,bash" */
+	function toolNouns(raw) {
+		const out = [];
+		String(raw || "").split(",").forEach((name) => {
+			const noun = toolNoun(name);
+			if (noun && out.indexOf(noun) < 0) out.push(noun);
+		});
+		return out;
+	}
+
+	/* The label shown on a folded entry. The angle brackets are a reading aid
+	 * inside the IDE only - nothing like this is ever sent to the model, where a
+	 * pseudo-tag around the setup prompt is exactly what makes it answer "this
+	 * is a prompt injection attempt" instead of working. */
+	function entryLabel(message) {
+		const kind = String(message.kind || "message");
+		const list = toolNouns(message.tool).join(" + ");
+		if (kind === "preamble") {
+			return String(message.tool || "") === "repair"
+				? "<EDITOR NOTE> ASKING AGAIN"
+				: "<SYSTEM PROMPT> EDITOR SETUP";
+		}
+		if (kind === "action") return "<ACTION> " + (list || "TOOL");
+		return "<RESULT> " + (list || "TOOL");
+	}
+
+	/* One entry of a stored transcript, as html. No DOM work per entry: a page
+	 * of these is joined and parsed in one go. */
+	function entryHtml(message) {
+		const kind = String(message.kind || "message");
+		const raw = String(message.content || "");
+		const text = raw.length > BODY_CLIP
+			? raw.slice(0, BODY_CLIP) + "\n\u2026 [" + (raw.length - BODY_CLIP) +
+				" more characters - the full text is in .monoide/chats]"
+			: raw;
+
+		if (kind === "thinking") return '<div class="think">' + esc(text) + "</div>";
+
+		if (kind === "preamble" || kind === "action" || kind === "observation") {
+			const state = kind === "preamble" ? "SETUP"
+				: kind === "action" ? "RAN"
+					: (message.failed ? "FAIL" : "OK");
+			const first = text.split("\n", 1)[0].slice(0, 120);
+			return '<div class="act' + (message.failed ? " fail" : "") + '">' +
+				'<div class="hd"><span class="tg">' + esc(entryLabel(message)) + "</span>" +
+				'<span class="sm">' + esc(first) + "</span>" +
+				'<span class="st">' + esc(state) + "</span></div>" +
+				'<pre class="hidden">' + esc(text) + "</pre></div>";
+		}
+
+		if (String(message.role) === "user") {
+			return '<div class="msg user"><div class="who">YOU</div>' +
+				'<div class="body">' + esc(text) + "</div></div>";
+		}
+		return '<div class="msg"><div class="who">AGENT</div>' +
+			'<div class="body">' + md(text) + "</div></div>";
+	}
+
 	function Chat(opts) {
 		this.log = opts.log;
 		this.status = opts.status;
@@ -83,6 +174,8 @@
 		this.chatId = "";
 		this.pinned = false;
 		this.historyCard = null;
+		/* the stored chat currently on screen, and how much of it is shown */
+		this.transcript = null;
 		this.initAgent();
 		this.initStorage();
 		this.initHistory();
@@ -396,6 +489,8 @@
 		const renderLocal = (payload) => {
 			const chats = (payload && payload.chats) || [];
 			if (!chats.length) return empty("NOTHING KEPT ON THIS PC YET");
+			// "MSG" is what was said; "ROWS" counts tool calls and pasted output as
+			// well, which is why an imported agent session is a four-figure number.
 			rows.innerHTML = chats.map((chat) =>
 				'<div class="row">' +
 				'<button class="btn" data-open="' + attr(chat.id) + '"' +
@@ -403,12 +498,17 @@
 				esc(String(chat.title || "untitled").toUpperCase().slice(0, 44)) + "</button>" +
 				'<span class="muted">' + esc([ago(chat.updated),
 					(chat.messages || 0) + " MSG",
+					chat.entries && chat.entries !== chat.messages
+						? chat.entries + " ROWS" : "",
 					chat.source === "claude-code" ? "IMPORTED" : ""]
 					.filter(Boolean).join("  ")) + "</span>" +
 				'<button class="btn" data-drop="' + attr(chat.id) + '">DEL</button>' +
 				"</div>").join("");
 			rows.querySelectorAll("button[data-open]").forEach((button) => {
-				button.onclick = () => this.openChat(button.dataset.open);
+				button.onclick = () => {
+					say("opening\u2026");
+					this.openChat(button.dataset.open);
+				};
 			});
 			rows.querySelectorAll("button[data-drop]").forEach((button) => {
 				button.onclick = async () => {
@@ -492,8 +592,8 @@
 					}
 					const chat = result.chat || {};
 					button.textContent = "IMPORTED";
-					say("imported " + (chat.messages || 0) +
-						" messages - see ON THIS PC");
+					say("imported " + (chat.messages || 0) + " messages in " +
+						(chat.entries || 0) + " rows - see ON THIS PC");
 				};
 			});
 			say("imports are kept on this pc, next to your local chats");
@@ -531,7 +631,11 @@
 	};
 
 	/* Repaint the log from a stored chat. Read-only on purpose: the agent's own
-	 * thread is gone, so continuing here would silently start a new one. */
+	 * thread is gone, so continuing here would silently start a new one.
+	 *
+	 * Only the newest page is put in the DOM. A real agent session is thousands
+	 * of entries carrying whole files, and appending them one by one - each
+	 * append reading scrollHeight - is what froze the window solid. */
 	Chat.prototype.openChat = async function (id) {
 		let record;
 		try {
@@ -552,51 +656,63 @@
 			return this.el("notice", "COULD NOT OPEN THAT CHAT: " +
 				esc(String(err.message).toUpperCase()));
 		}
+
 		this.historyCard = null;
 		this.log.innerHTML = "";
+
+		const messages = (record.messages || []).filter(
+			(item) => item && typeof item === "object");
+		const spoken = messages.filter((item) =>
+			!item.kind || item.kind === "message").length;
 		const origin = record.origin || {};
 		this.el("notice", "TRANSCRIPT: " +
 			esc(String(record.title || "untitled").toUpperCase()) +
 			(origin.tool ? " \u2014 FROM " + esc(String(origin.tool).toUpperCase()) : "") +
+			" \u2014 " + spoken + " MESSAGES IN " + messages.length + " ROWS" +
 			" \u2014 READ ONLY, PRESS NEW TO START A CHAT");
-		let lastAct = null;
-		for (const message of record.messages || []) {
-			const text = String(message.content || "");
-			if (message.kind === "thinking") {
-				const node = this.el("think", "");
-				node.textContent = text;
-			} else if (message.kind === "action") {
-				const act = this.el("act",
-					'<div class="hd"><span class="tg">' + esc(message.tool || "tool") + "</span>" +
-					'<span class="sm"></span><span class="st">RAN</span></div>' +
-					'<pre class="hidden"></pre>');
-				act.querySelector(".sm").textContent = text.split("\n")[0].slice(0, 120);
-				act.querySelector("pre").textContent = text;
-				act.querySelector(".hd").onclick = () =>
-					act.querySelector("pre").classList.toggle("hidden");
-				lastAct = act;
-			} else if (message.kind === "observation") {
-				if (lastAct) {
-					lastAct.querySelector(".st").textContent = message.failed ? "FAIL" : "OK";
-					if (message.failed) lastAct.classList.add("fail");
-					lastAct.querySelector("pre").textContent = text;
-					lastAct = null;
-				} else {
-					const act = this.el("act",
-						'<div class="hd"><span class="tg">OUTPUT</span>' +
-						'<span class="st">' + (message.failed ? "FAIL" : "OK") + "</span></div>" +
-						"<pre></pre>");
-					act.querySelector("pre").textContent = text;
-				}
-			} else if (message.role === "user") {
-				this.el("msg user",
-					'<div class="who">YOU</div><div class="body">' + esc(text) + "</div>");
-			} else {
-				this.el("msg",
-					'<div class="who">AGENT</div><div class="body">' + md(text) + "</div>");
-			}
+
+		const earlier = this.el("row", "");
+		const host = this.el("transcript", "");
+		// One handler for the whole page instead of one per entry: a thousand
+		// closures is a thousand things the browser keeps alive for nothing.
+		host.onclick = (event) => {
+			const head = event.target.closest(".hd");
+			if (!head || !host.contains(head)) return;
+			const pre = head.parentNode.querySelector("pre");
+			if (pre) pre.classList.toggle("hidden");
+		};
+
+		this.transcript = { messages, shown: 0, host, earlier };
+		this.showTranscript();
+	};
+
+	/* Put one more page at the top of the transcript. */
+	Chat.prototype.showTranscript = function () {
+		const state = this.transcript;
+		if (!state) return;
+		const total = state.messages.length;
+		const end = total - state.shown;
+		if (end <= 0) return;
+		const start = Math.max(0, end - TRANSCRIPT_PAGE);
+
+		const chunk = document.createElement("div");
+		chunk.className = "page";
+		chunk.innerHTML = state.messages.slice(start, end).map(entryHtml).join("");
+		state.host.insertBefore(chunk, state.host.firstChild);
+		state.shown += end - start;
+
+		const left = total - state.shown;
+		if (!left) {
+			state.earlier.innerHTML = "";
+			return;
 		}
-		this.log.scrollTop = 0;
+		state.earlier.innerHTML = '<button class="btn">EARLIER \u2014 ' + left +
+			" ROWS ABOVE</button>";
+		state.earlier.querySelector("button").onclick = () => this.showTranscript();
+		if (state.shown <= TRANSCRIPT_PAGE) {
+			// first page: land at the end of the conversation, like a chat
+			this.log.scrollTop = this.log.scrollHeight;
+		}
 	};
 
 	Chat.prototype.setBusy = function (busy, label) {
@@ -617,6 +733,8 @@
 		this.session = null;
 		this.agentCard = null;
 		this.historyCard = null;
+		// drop the stored transcript, so its rows are not kept in memory
+		this.transcript = null;
 		// a fresh chat gets the choice back
 		this.chatId = "";
 		this.pinned = false;
