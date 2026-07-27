@@ -22,6 +22,12 @@ when the caller replays the conversation_id it handed out in the
 X-Conversation-Id response header. Without that, one user message turns into a
 dozen chats in Notion - one per tool round. Upstream therefore remembers the
 conversation id and Session feeds it back on every round.
+
+Heavy mode caveat: notion2api rebuilds the Notion transcript from its own
+sqlite sliding window and forwards only the LAST message of the request
+(conversation.get_transcript_payload(new_prompt=...)). Anything we put earlier
+in the list - including the runner preamble - is dropped. _payload_messages()
+therefore folds the preamble into the outgoing last user message.
 """
 
 from __future__ import annotations
@@ -319,6 +325,33 @@ class Session:
             total -= len(self.messages[index]["content"])
             self.messages.pop(index)
 
+    # -- request payload ---------------------------------------------------
+    def _heavy_mode(self) -> bool:
+        mode = str(self.config.get("upstream", "app_mode", default="heavy") or "heavy")
+        return mode.strip().lower() == "heavy"
+
+    def _payload_messages(self) -> List[Dict[str, str]]:
+        """Messages to actually send upstream.
+
+        In heavy mode notion2api ignores everything except the last message: it
+        rebuilds the Notion transcript from its own sqlite window and passes our
+        final message as `new_prompt`. The preamble (message 0) would silently
+        disappear, leaving the model with just the turn reminder - it then has no
+        idea it is driving a local editor and no tool protocol to follow.
+        So the preamble rides along with the last user message instead.
+        """
+        messages = self.messages
+        if not self._heavy_mode() or len(messages) < 2:
+            return messages
+        preamble = messages[0]["content"]
+        last = messages[-1]
+        if last["role"] != "user" or not preamble:
+            return messages
+        if preamble in last["content"]:
+            return messages
+        merged = f"{preamble}\n\n---\n\n{last['content']}"
+        return messages[:-1] + [{"role": "user", "content": merged}]
+
     # -- main loop ---------------------------------------------------------
     def run(self, user_text: str, *, attachments: Optional[List[str]] = None,
             emit: Callable[[str, Dict[str, Any]], None]) -> None:
@@ -372,7 +405,7 @@ class Session:
             self._trim()
             emit("status", {"text": f"round {round_index}"})
             assistant_text = ""
-            for chunk in upstream.stream(self.messages, model, self.conversation_id):
+            for chunk in upstream.stream(self._payload_messages(), model, self.conversation_id):
                 if chunk["type"] == "thinking":
                     emit("thinking", {"text": chunk["text"]})
                     continue
