@@ -28,13 +28,22 @@ How the choice gets here
 ------------------------
 monoIDE writes it into a small json file (``ide/config.py``,
 ``write_agent_target``); an agent only exists in the workspace that owns it, so
-nothing can be baked into the source. Two hooks are installed from
+nothing can be baked into the source. Three hooks are installed from
 ``app/api/__init__.py``:
 
 * the transcript builders, so every config block carries the workflow id;
-* ``cloudscraper.create_scraper``, so the outgoing runInferenceTranscript
+* ``NotionOpusAPI.stream_response``, so the outgoing runInferenceTranscript
   payload gets the workflow thread parent - that payload is a local variable
-  inside ``notion_client.stream_response`` and the transport is the only seam.
+  inside ``stream_response`` and the transport is the only seam;
+* ``cloudscraper.create_scraper``, for clients built after we load.
+
+Why the client class and not only the scraper factory: ``NotionOpusAPI`` builds
+its scraper in ``__init__``. An account client constructed before this module
+loads keeps an unpatched transport forever, and then only half the change lands
+- workflowId in the config block, thread still parented to the space - which
+Notion accepts while answering with the default assistant. Wrapping
+``stream_response`` fixes the ordering for good: it proxies the live instance's
+scraper on every call, whenever that instance was created.
 
 With the file missing or set to "notion", nothing is touched at all.
 """
@@ -279,6 +288,64 @@ class _AgentAwareScraper:
         return self._inner.post(*args, **kwargs)
 
 
+def _proxy_transport(client: Any) -> bool:
+    """Wrap a live client's scraper, unless it is already wrapped.
+
+    ``NotionOpusAPI`` swaps ``_scraper`` under a lock when Cloudflare forces a
+    rebuild, so the swap is done under the same lock.
+    """
+    scraper = getattr(client, "_scraper", None)
+    if scraper is None or isinstance(scraper, _AgentAwareScraper):
+        return False
+    lock = getattr(client, "_scraper_lock", None)
+    if lock is None:
+        client._scraper = _AgentAwareScraper(scraper)
+        return True
+    with lock:
+        current = getattr(client, "_scraper", None)
+        if current is None or isinstance(current, _AgentAwareScraper):
+            return False
+        client._scraper = _AgentAwareScraper(current)
+    return True
+
+
+def _install_client() -> None:
+    """Wrap ``stream_response`` so the transport is proxied on every call.
+
+    This is what makes the override independent of import order: the account
+    client may well predate this module, and a client built back then holds a
+    scraper the factory hook below never saw.
+    """
+    from app import notion_client as nc
+
+    api = getattr(nc, "NotionOpusAPI", None)
+    if api is None:
+        return
+    original = getattr(api, "stream_response", None)
+    if original is None or getattr(original, "_agent_hook", False):
+        return
+
+    def stream_hook(self, transcript, thread_id=None):
+        agent = current_agent()
+        if agent:
+            wrapped = _proxy_transport(self)
+            _log(
+                "Custom agent selected for this request",
+                event="custom_agent_stream",
+                workflow_id=agent["id"],
+                agent_name=agent.get("name") or "",
+                transport_wrapped_now=wrapped,
+                reused_thread=bool(thread_id),
+            )
+        # a plain function, so this ran before the generator body: the payload
+        # is built after the transport is already proxied
+        return original(self, transcript, thread_id)
+
+    stream_hook._agent_hook = True  # type: ignore[attr-defined]
+    stream_hook.__name__ = "stream_response"
+    api.stream_response = stream_hook
+
+
 def _install_transport() -> None:
     import cloudscraper
 
@@ -290,16 +357,16 @@ def _install_transport() -> None:
         return _AgentAwareScraper(original(*args, **kwargs))
 
     create_scraper_hook._agent_hook = True  # type: ignore[attr-defined]
-    # notion_client calls cloudscraper.create_scraper() lazily - at init and
-    # again when a 403 forces a rebuild - so both paths get the proxy
+    # covers clients built from now on; _install_client covers the rest
     cloudscraper.create_scraper = create_scraper_hook
 
 
 def install() -> None:
-    """Install both hooks. Safe to call more than once."""
+    """Install every hook. Safe to call more than once."""
     global _installed
     if _installed:
         return
     _installed = True
     _install_builders()
+    _install_client()
     _install_transport()
