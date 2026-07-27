@@ -6,6 +6,11 @@
  * manual fallback for an agent the list does not show. Nothing agent-specific
  * is ever shipped in the source - an agent only exists inside the workspace
  * that owns it.
+ *
+ * It owns one more choice: where a chat is kept. That is asked next to SEND and
+ * only while the chat is still empty - once the first message is away the
+ * transcript is already being written one way or the other, so the switch
+ * pins itself and disappears.
  */
 
 (function (global) {
@@ -29,6 +34,19 @@
 		if (digits.length !== 32) return "";
 		return [digits.slice(0, 8), digits.slice(8, 12), digits.slice(12, 16),
 			digits.slice(16, 20), digits.slice(20)].join("-");
+	}
+
+	/* "3 hours ago" from a millisecond stamp; "" when there is none */
+	function ago(ms) {
+		const stamp = Number(ms || 0);
+		if (!stamp) return "";
+		const seconds = Math.max(1, Math.round((Date.now() - stamp) / 1000));
+		if (seconds < 90) return seconds + "S AGO";
+		const minutes = Math.round(seconds / 60);
+		if (minutes < 90) return minutes + "M AGO";
+		const hours = Math.round(minutes / 60);
+		if (hours < 36) return hours + "H AGO";
+		return Math.round(hours / 24) + "D AGO";
 	}
 
 	/* very small markdown: fenced code, inline code, bold, bullets */
@@ -60,7 +78,14 @@
 		this.acts = {};
 		this.agent = { mode: "notion", id: "", url: "", name: "" };
 		this.agentCard = null;
+		/* where this chat is kept. "web" means Notion only: nothing on this pc. */
+		this.storage = "local";
+		this.chatId = "";
+		this.pinned = false;
+		this.historyCard = null;
 		this.initAgent();
+		this.initStorage();
+		this.initHistory();
 	}
 
 	Chat.prototype.el = function (cls, html) {
@@ -84,7 +109,8 @@
 	Chat.prototype.loadAgent = async function () {
 		try {
 			const state = await (await fetch("/api/state")).json();
-			const up = ((state || {}).config || {}).upstream || {};
+			const config = (state || {}).config || {};
+			const up = config.upstream || {};
 			const custom = String(up.agent_mode || "notion").toLowerCase() === "custom";
 			this.agent = {
 				mode: custom ? "custom" : "notion",
@@ -92,6 +118,12 @@
 				url: String(up.agent_url || ""),
 				name: String(up.agent_name || ""),
 			};
+			// a remembered preference, if the config carries one
+			const preferred = String(((config.chat || {}).storage) || "").toLowerCase();
+			if (!this.pinned && (preferred === "local" || preferred === "web")) {
+				this.storage = preferred;
+				this.paintStorage();
+			}
 		} catch (err) {
 			/* keep the default; the button just shows NOTION AI */
 		}
@@ -126,7 +158,7 @@
 			'<button class="btn" data-m="custom">MY CUSTOM AGENT</button>' +
 			"</div>" +
 			'<div id="agent-fields">' +
-			'<div class="row" id="agent-list"><span class="muted">READING YOUR AGENTS…</span></div>' +
+			'<div class="row" id="agent-list"><span class="muted">READING YOUR AGENTS\u2026</span></div>' +
 			'<div class="row"><input class="in" id="agent-link" autocomplete="off"' +
 			' placeholder="OR PASTE AN AGENT LINK" value="' + attr(this.agent.url) + '"></div>' +
 			"</div>" +
@@ -152,14 +184,14 @@
 
 		const renderAgents = (rows) => {
 			if (!rows.length) {
-				list.innerHTML = '<span class="muted">THIS ACCOUNT HAS NO CUSTOM AGENTS — ' +
+				list.innerHTML = '<span class="muted">THIS ACCOUNT HAS NO CUSTOM AGENTS \u2014 ' +
 					"PASTE A LINK INSTEAD</span>";
 				return;
 			}
 			list.innerHTML = rows.map((row) =>
 				'<button class="btn" data-id="' + attr(row.id) + '"' +
 				' data-name="' + attr(row.name) + '"' +
-				' title="' + attr((row.model || "") + (row.last_chat ? " — " + row.last_chat : "")) + '">' +
+				' title="' + attr((row.model || "") + (row.last_chat ? " \u2014 " + row.last_chat : "")) + '">' +
 				esc(String(row.name || "").toUpperCase()) + "</button>").join(" ");
 			list.querySelectorAll("button[data-id]").forEach((button) => {
 				button.onclick = () => {
@@ -188,7 +220,7 @@
 			if (payload && payload.error) {
 				listed = false;
 				list.innerHTML = '<span class="muted">' +
-					esc(String(payload.error).toUpperCase()) + " — PASTE A LINK INSTEAD</span>";
+					esc(String(payload.error).toUpperCase()) + " \u2014 PASTE A LINK INSTEAD</span>";
 				return;
 			}
 			renderAgents((payload && payload.agents) || []);
@@ -222,7 +254,7 @@
 				if (url) {
 					// A pasted link may point at an agent the list did not show, so
 					// resolve it against Notion rather than trusting the shape.
-					hint.textContent = "CHECKING THAT LINK…";
+					hint.textContent = "CHECKING THAT LINK\u2026";
 					let verdict;
 					try {
 						verdict = await (await fetch("/api/agents/verify", {
@@ -275,7 +307,7 @@
 			// backend starts a fresh chat on the next message by itself
 			this.el("notice", mode === "custom"
 				? "AGENT SELECTED: " + String(agentName).toUpperCase() +
-					" — A NEW NOTION CHAT STARTS WITH THE NEXT MESSAGE"
+					" \u2014 A NEW NOTION CHAT STARTS WITH THE NEXT MESSAGE"
 				: "BACK TO THE DEFAULT NOTION AI ASSISTANT");
 		};
 
@@ -285,6 +317,261 @@
 			if (event.key === "Enter") { event.preventDefault(); save(); }
 		};
 		void name;
+	};
+
+	/* -- where this chat is kept ------------------------------------------ */
+
+	Chat.prototype.initStorage = function () {
+		this.storagePick = document.getElementById("storage-pick");
+		if (!this.storagePick) return;
+		this.storagePick.querySelectorAll("button[data-s]").forEach((button) => {
+			button.onclick = () => {
+				// After the first message the chat is already being kept one way or
+				// the other; the switch is gone by then, but never trust the DOM.
+				if (this.pinned) return;
+				this.storage = button.dataset.s === "web" ? "web" : "local";
+				this.paintStorage();
+				// remember it as the default for the next chat, best effort
+				fetch("/api/config", {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ set: { "chat.storage": this.storage } }),
+				}).catch(() => {});
+			};
+		});
+		this.paintStorage();
+	};
+
+	Chat.prototype.paintStorage = function () {
+		if (!this.storagePick) return;
+		this.storagePick.style.display = this.pinned ? "none" : "";
+		this.storagePick.querySelectorAll("button[data-s]").forEach((button) =>
+			button.classList.toggle("solid", button.dataset.s === this.storage));
+	};
+
+	Chat.prototype.pinStorage = function () {
+		if (this.pinned) return;
+		this.pinned = true;
+		this.paintStorage();
+		this.el("notice", this.storage === "web"
+			? "WEB HISTORY \u2014 THIS CHAT LIVES IN NOTION ONLY, NOTHING IS WRITTEN TO THIS PC"
+			: "LOCAL HISTORY \u2014 THIS CHAT IS KEPT IN .MONOIDE/CHATS");
+	};
+
+	/* -- past chats and imports ------------------------------------------- */
+
+	Chat.prototype.initHistory = function () {
+		const button = document.getElementById("btn-history");
+		if (!button) return;
+		button.onclick = () => this.openHistory();
+	};
+
+	Chat.prototype.openHistory = function () {
+		if (this.historyCard) {
+			this.historyCard.remove();
+			this.historyCard = null;
+		}
+		const node = this.el("ask",
+			'<div class="q">CHAT HISTORY</div>' +
+			'<div class="row">' +
+			'<button class="btn solid" data-t="local">ON THIS PC</button>' +
+			'<button class="btn" data-t="web">IN NOTION</button>' +
+			'<button class="btn" data-t="claude">CLAUDE CODE</button>' +
+			"</div>" +
+			'<div id="hist-rows"><span class="muted">LOADING\u2026</span></div>' +
+			'<div class="row"><button class="btn" data-a="close">CLOSE</button></div>' +
+			'<div class="muted" id="hist-hint"></div>');
+		this.historyCard = node;
+
+		const rows = node.querySelector("#hist-rows");
+		const hint = node.querySelector("#hist-hint");
+		const tabs = node.querySelectorAll("button[data-t]");
+		let tab = "local";
+
+		const say = (text) => { hint.textContent = String(text || "").toUpperCase(); };
+		const empty = (text) => { rows.innerHTML = '<span class="muted">' + esc(text) + "</span>"; };
+
+		const rowHtml = (row, actions) =>
+			'<div class="row">' +
+			'<button class="btn" data-open="' + attr(row.id) + '"' +
+			' title="' + attr(row.subtitle || "") + '">' +
+			esc(String(row.title || "untitled").toUpperCase().slice(0, 44)) + "</button>" +
+			'<span class="muted">' + esc(row.meta || "") + "</span>" + (actions || "") +
+			"</div>";
+
+		const renderLocal = (payload) => {
+			const chats = (payload && payload.chats) || [];
+			if (!chats.length) return empty("NOTHING KEPT ON THIS PC YET");
+			rows.innerHTML = chats.map((chat) => rowHtml({
+				id: chat.id,
+				title: chat.title,
+				meta: [ago(chat.updated), (chat.messages || 0) + " MSG",
+					chat.source === "claude-code" ? "IMPORTED" : ""]
+					.filter(Boolean).join("  "),
+				subtitle: chat.id,
+			}, '<button class="btn" data-drop="' + attr(chat.id) + '">DEL</button>')).join("");
+			rows.querySelectorAll("button[data-open]").forEach((button) => {
+				button.onclick = () => this.openChat(button.dataset.open);
+			});
+			rows.querySelectorAll("button[data-drop]").forEach((button) => {
+				button.onclick = async () => {
+					button.disabled = true;
+					try {
+						await fetch("/api/chat/delete", {
+							method: "POST",
+							headers: { "Content-Type": "application/json" },
+							body: JSON.stringify({ id: button.dataset.drop }),
+						});
+					} catch (err) {
+						return say("could not delete: " + err.message);
+					}
+					button.closest(".row").remove();
+				};
+			});
+		};
+
+		const renderWeb = (payload) => {
+			const chats = (payload && payload.chats) || [];
+			if (payload && payload.error) return empty(String(payload.error).toUpperCase());
+			if (!chats.length) {
+				return empty("NO CHATS IN NOTION FOR THE SELECTED AGENT YET");
+			}
+			// Web chats live in Notion, so there is nothing here to open locally.
+			rows.innerHTML = chats.map((chat) =>
+				'<div class="row"><span>' +
+				esc(String(chat.title || "untitled").toUpperCase().slice(0, 44)) + "</span>" +
+				'<span class="muted">' + esc(ago(chat.updated)) + "</span></div>").join("");
+			say("kept in notion only - open them in notion itself");
+		};
+
+		const renderClaude = (payload) => {
+			const sessions = (payload && payload.sessions) || [];
+			if (!sessions.length) {
+				return empty("NO CLAUDE CODE SESSIONS FOUND UNDER " +
+					String((payload && payload.dir) || "~/.claude/projects").toUpperCase());
+			}
+			rows.innerHTML = sessions.map((item) =>
+				'<div class="row">' +
+				'<button class="btn" data-import="' + attr(item.path) + '"' +
+				' title="' + attr(item.path) + '">' +
+				esc(String(item.project || item.id || "session").toUpperCase().slice(0, 40)) +
+				"</button>" +
+				'<span class="muted">' + esc([ago(item.modified),
+					item.size ? Math.round(item.size / 1024) + " KB" : ""]
+					.filter(Boolean).join("  ")) + "</span></div>").join("");
+			rows.querySelectorAll("button[data-import]").forEach((button) => {
+				button.onclick = async () => {
+					button.disabled = true;
+					say("importing\u2026");
+					let result;
+					try {
+						result = await (await fetch("/api/chat/import", {
+							method: "POST",
+							headers: { "Content-Type": "application/json" },
+							body: JSON.stringify({ path: button.dataset.import }),
+						})).json();
+					} catch (err) {
+						button.disabled = false;
+						return say("import failed: " + err.message);
+					}
+					if (!result || !result.ok) {
+						button.disabled = false;
+						return say("import failed: " +
+							((result && result.error) || "unknown reason"));
+					}
+					const chat = result.chat || {};
+					say("imported " + (chat.messages || 0) + " messages - see ON THIS PC");
+					button.textContent = "IMPORTED";
+				};
+			});
+			say("imports are kept on this pc, next to your local chats");
+		};
+
+		const load = async () => {
+			empty("LOADING\u2026");
+			say("");
+			const url = tab === "local" ? "/api/chat/sessions"
+				: tab === "web" ? "/api/chat/remote" : "/api/chat/imports";
+			let payload;
+			try {
+				payload = await (await fetch(url)).json();
+			} catch (err) {
+				return empty("COULD NOT READ THE HISTORY: " +
+					String(err.message).toUpperCase());
+			}
+			if (tab === "local") renderLocal(payload);
+			else if (tab === "web") renderWeb(payload);
+			else renderClaude(payload);
+		};
+
+		tabs.forEach((button) => {
+			button.onclick = () => {
+				tab = button.dataset.t;
+				tabs.forEach((other) => other.classList.toggle("solid", other === button));
+				load();
+			};
+		});
+		node.querySelector('button[data-a="close"]').onclick = () => {
+			node.remove();
+			this.historyCard = null;
+		};
+		load();
+	};
+
+	/* Repaint the log from a stored chat. Read-only on purpose: the agent's own
+	 * thread is gone, so continuing here would silently start a new one. */
+	Chat.prototype.openChat = async function (id) {
+		let record;
+		try {
+			const response = await fetch("/api/chat/session?id=" + encodeURIComponent(id));
+			if (!response.ok) throw new Error("HTTP " + response.status);
+			record = await response.json();
+		} catch (err) {
+			return this.el("notice", "COULD NOT OPEN THAT CHAT: " + esc(err.message));
+		}
+		this.historyCard = null;
+		this.log.innerHTML = "";
+		const origin = record.origin || {};
+		this.el("notice", "TRANSCRIPT: " +
+			esc(String(record.title || "untitled").toUpperCase()) +
+			(origin.tool ? " \u2014 FROM " + esc(String(origin.tool).toUpperCase()) : "") +
+			" \u2014 READ ONLY, PRESS NEW TO START A CHAT");
+		let lastAct = null;
+		for (const message of record.messages || []) {
+			const text = String(message.content || "");
+			if (message.kind === "thinking") {
+				const node = this.el("think", "");
+				node.textContent = text;
+			} else if (message.kind === "action") {
+				lastAct = this.el("act",
+					'<div class="hd"><span class="tg">' + esc(message.tool || "tool") + "</span>" +
+					'<span class="sm"></span><span class="st">RAN</span></div>' +
+					'<pre class="hidden"></pre>');
+				lastAct.querySelector(".sm").textContent = text.split("\n")[0].slice(0, 120);
+				lastAct.querySelector("pre").textContent = text;
+				const act = lastAct;
+				act.querySelector(".hd").onclick = () =>
+					act.querySelector("pre").classList.toggle("hidden");
+			} else if (message.kind === "observation") {
+				if (lastAct) {
+					lastAct.querySelector(".st").textContent = message.failed ? "FAIL" : "OK";
+					if (message.failed) lastAct.classList.add("fail");
+					const pre = lastAct.querySelector("pre");
+					pre.textContent = text;
+					lastAct = null;
+				} else {
+					this.el("act", '<div class="hd"><span class="tg">OUTPUT</span></div>')
+						.appendChild(document.createElement("pre")).textContent = text;
+				}
+			} else if (message.role === "user") {
+				this.el("msg user",
+					'<div class="who">YOU</div><div class="body">' + esc(text) + "</div>");
+			} else {
+				this.el("msg",
+					'<div class="who">AGENT</div><div class="body">' + md(text) + "</div>");
+			}
+		}
+		this.log.scrollTop = 0;
 	};
 
 	Chat.prototype.setBusy = function (busy, label) {
@@ -304,8 +591,13 @@
 		}
 		this.session = null;
 		this.agentCard = null;
+		this.historyCard = null;
+		// a fresh chat gets the choice back
+		this.chatId = "";
+		this.pinned = false;
+		this.paintStorage();
 		this.log.innerHTML = "";
-		this.el("notice", "NEW SESSION — BRIDGE PREAMBLE WILL BE RESENT");
+		this.el("notice", "NEW SESSION \u2014 BRIDGE PREAMBLE WILL BE RESENT");
 	};
 
 	Chat.prototype.send = async function (text) {
@@ -325,6 +617,9 @@
 					session: this.session,
 					message: text,
 					attachments: this.getAttachments(),
+					// only honoured for the first message of a chat
+					storage: this.storage,
+					chat: this.chatId,
 				}),
 			});
 		} catch (err) {
@@ -387,6 +682,13 @@
 		switch (event) {
 			case "session":
 				this.session = data.id;
+				break;
+
+			case "chat":
+				// the backend decides and reports; it also pins the mode
+				this.chatId = String(data.id || this.chatId);
+				if (data.storage) this.storage = data.storage;
+				this.pinStorage();
 				break;
 
 			case "status":
@@ -464,13 +766,14 @@
 			case "end":
 				this.current = null;
 				this._think = null;
+				if (data && data.chat) this.chatId = String(data.chat);
 				break;
 		}
 	};
 
 	Chat.prototype.ask = function (data) {
 		const node = this.el("ask",
-			'<div class="q">APPROVAL REQUIRED — ' + esc(data.tool.toUpperCase()) + "</div>" +
+			'<div class="q">APPROVAL REQUIRED \u2014 ' + esc(data.tool.toUpperCase()) + "</div>" +
 			"<code>" + esc(data.summary) + "</code>" +
 			'<div class="row">' +
 			'<button class="btn solid" data-d="allow_once">ALLOW ONCE</button>' +
