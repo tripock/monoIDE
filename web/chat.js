@@ -1,9 +1,11 @@
 /* Agent panel: SSE client for /api/chat, activity log, approval prompts.
  *
  * The panel also owns the "who answers" switch: the default Notion AI assistant
- * or one of the user's own agents. Agents are workspace-local, so the only way
- * to know one is to have the user paste its link - nothing about it can be
- * shipped in the source.
+ * or one of the user's own agents. The agents of the signed-in account are read
+ * from /api/agents, so picking one is a click; pasting a link stays as the
+ * manual fallback for an agent the list does not show. Nothing agent-specific
+ * is ever shipped in the source - an agent only exists inside the workspace
+ * that owns it.
  */
 
 (function (global) {
@@ -56,7 +58,7 @@
 		this.controller = null;
 		this.current = null;
 		this.acts = {};
-		this.agent = { mode: "notion", url: "", name: "" };
+		this.agent = { mode: "notion", id: "", url: "", name: "" };
 		this.agentCard = null;
 		this.initAgent();
 	}
@@ -86,6 +88,7 @@
 			const custom = String(up.agent_mode || "notion").toLowerCase() === "custom";
 			this.agent = {
 				mode: custom ? "custom" : "notion",
+				id: String(up.agent_id || ""),
 				url: String(up.agent_url || ""),
 				name: String(up.agent_name || ""),
 			};
@@ -97,13 +100,14 @@
 
 	Chat.prototype.paintAgent = function () {
 		if (!this.agentBtn) return;
-		const custom = this.agent.mode === "custom" && this.agent.url;
+		const target = this.agent.id || this.agent.url;
+		const custom = this.agent.mode === "custom" && !!target;
 		const label = custom ? (this.agent.name || "CUSTOM AGENT") : "NOTION AI";
 		this.agentBtn.textContent = "AGENT: " + String(label).toUpperCase().slice(0, 22);
 		this.agentBtn.title = custom
-			? "custom agent: " + this.agent.url
+			? "custom agent: " + target
 			: "the default Notion AI assistant";
-		this.agentBtn.classList.toggle("solid", !!custom);
+		this.agentBtn.classList.toggle("solid", custom);
 	};
 
 	Chat.prototype.pickAgent = function () {
@@ -112,6 +116,9 @@
 			this.agentCard = null;
 		}
 		let mode = this.agent.mode;
+		let chosen = { id: this.agent.id, name: this.agent.name };
+		let listed = false;   // the list is fetched once, and only when needed
+
 		const node = this.el("ask",
 			'<div class="q">WHO ANSWERS IN THIS IDE?</div>' +
 			'<div class="row">' +
@@ -119,35 +126,84 @@
 			'<button class="btn" data-m="custom">MY CUSTOM AGENT</button>' +
 			"</div>" +
 			'<div id="agent-fields">' +
+			'<div class="row" id="agent-list"><span class="muted">READING YOUR AGENTS…</span></div>' +
 			'<div class="row"><input class="in" id="agent-link" autocomplete="off"' +
-			' placeholder="PASTE THE AGENT LINK (NOTION.SO/…)" value="' + attr(this.agent.url) + '"></div>' +
-			'<div class="row"><input class="in" id="agent-name" autocomplete="off"' +
-			' placeholder="LABEL FOR THE BUTTON (OPTIONAL)" value="' + attr(this.agent.name) + '"></div>' +
+			' placeholder="OR PASTE AN AGENT LINK" value="' + attr(this.agent.url) + '"></div>' +
 			"</div>" +
 			'<div class="row">' +
 			'<button class="btn solid" data-a="save">SAVE</button>' +
 			'<button class="btn" data-a="cancel">CANCEL</button>' +
 			"</div>" +
-			'<div class="muted" id="agent-hint">OPEN THE AGENT IN NOTION AND COPY ITS LINK — ' +
-			"AN AGENT ONLY EXISTS IN THE WORKSPACE THAT OWNS IT</div>");
+			'<div class="muted" id="agent-hint">AGENTS COME FROM THE NOTION ACCOUNT THIS IDE ' +
+			"IS SIGNED IN WITH</div>");
 		this.agentCard = node;
 
 		const fields = node.querySelector("#agent-fields");
+		const list = node.querySelector("#agent-list");
 		const hint = node.querySelector("#agent-hint");
 		const link = node.querySelector("#agent-link");
-		const name = node.querySelector("#agent-name");
+		const name = null;
 		const modeButtons = node.querySelectorAll("button[data-m]");
+
+		const paintChoice = () => {
+			list.querySelectorAll("button[data-id]").forEach((button) =>
+				button.classList.toggle("solid", button.dataset.id === chosen.id));
+		};
+
+		const renderAgents = (rows) => {
+			if (!rows.length) {
+				list.innerHTML = '<span class="muted">THIS ACCOUNT HAS NO CUSTOM AGENTS — ' +
+					"PASTE A LINK INSTEAD</span>";
+				return;
+			}
+			list.innerHTML = rows.map((row) =>
+				'<button class="btn" data-id="' + attr(row.id) + '"' +
+				' data-name="' + attr(row.name) + '"' +
+				' title="' + attr((row.model || "") + (row.last_chat ? " — " + row.last_chat : "")) + '">' +
+				esc(String(row.name || "").toUpperCase()) + "</button>").join(" ");
+			list.querySelectorAll("button[data-id]").forEach((button) => {
+				button.onclick = () => {
+					chosen = { id: button.dataset.id, name: button.dataset.name };
+					// a click on a row wins over a stale link left in the field
+					link.value = "";
+					hint.textContent = "SELECTED: " + String(chosen.name).toUpperCase();
+					paintChoice();
+				};
+			});
+			paintChoice();
+		};
+
+		const loadList = async () => {
+			if (listed) return;
+			listed = true;
+			let payload;
+			try {
+				payload = await (await fetch("/api/agents")).json();
+			} catch (err) {
+				listed = false;   // let the next open retry
+				list.innerHTML = '<span class="muted">COULD NOT READ THE AGENT LIST: ' +
+					esc(String(err.message).toUpperCase()) + "</span>";
+				return;
+			}
+			if (payload && payload.error) {
+				listed = false;
+				list.innerHTML = '<span class="muted">' +
+					esc(String(payload.error).toUpperCase()) + " — PASTE A LINK INSTEAD</span>";
+				return;
+			}
+			renderAgents((payload && payload.agents) || []);
+		};
 
 		const paint = () => {
 			fields.style.display = mode === "custom" ? "" : "none";
 			modeButtons.forEach((button) =>
 				button.classList.toggle("solid", button.dataset.m === mode));
+			if (mode === "custom") loadList();
 		};
 		modeButtons.forEach((button) => {
 			button.onclick = () => {
 				mode = button.dataset.m;
 				paint();
-				if (mode === "custom") link.focus();
 			};
 		});
 		paint();
@@ -159,15 +215,38 @@
 
 		const save = async () => {
 			const url = link.value.trim();
-			const label = name.value.trim();
 			let agentId = "";
+			let agentUrl = "";
+			let agentName = "";
 			if (mode === "custom") {
-				agentId = agentIdFromUrl(url);
-				if (!agentId) {
-					hint.textContent = url
-						? "NO AGENT ID IN THAT LINK — IT SHOULD CONTAIN A 32-CHARACTER ID"
-						: "PASTE THE LINK TO YOUR AGENT FIRST";
-					link.focus();
+				if (url) {
+					// A pasted link may point at an agent the list did not show, so
+					// resolve it against Notion rather than trusting the shape.
+					hint.textContent = "CHECKING THAT LINK…";
+					let verdict;
+					try {
+						verdict = await (await fetch("/api/agents/verify", {
+							method: "POST",
+							headers: { "Content-Type": "application/json" },
+							body: JSON.stringify({ agent: url }),
+						})).json();
+					} catch (err) {
+						verdict = { ok: false, detail: err.message };
+					}
+					if (!verdict || !verdict.ok) {
+						hint.textContent = "UNUSABLE LINK: " +
+							String((verdict && verdict.detail) || "unknown reason").toUpperCase();
+						link.focus();
+						return;
+					}
+					agentId = verdict.id;
+					agentUrl = url;
+					agentName = verdict.name || "custom agent";
+				} else if (chosen.id) {
+					agentId = chosen.id;
+					agentName = chosen.name || "custom agent";
+				} else {
+					hint.textContent = "PICK AN AGENT ABOVE, OR PASTE ITS LINK";
 					return;
 				}
 			}
@@ -178,9 +257,9 @@
 					body: JSON.stringify({
 						set: {
 							"upstream.agent_mode": mode,
-							"upstream.agent_url": mode === "custom" ? url : "",
+							"upstream.agent_url": agentUrl,
 							"upstream.agent_id": agentId,
-							"upstream.agent_name": mode === "custom" ? label : "",
+							"upstream.agent_name": agentName,
 						},
 					}),
 				});
@@ -189,17 +268,14 @@
 				hint.textContent = "COULD NOT SAVE: " + String(err.message).toUpperCase();
 				return;
 			}
-			this.agent = {
-				mode,
-				url: mode === "custom" ? url : "",
-				name: mode === "custom" ? label : "",
-			};
+			this.agent = { mode, id: agentId, url: agentUrl, name: agentName };
 			this.paintAgent();
 			close();
 			// the bound Notion thread belongs to the previous assistant, so the
 			// backend starts a fresh chat on the next message by itself
 			this.el("notice", mode === "custom"
-				? "CUSTOM AGENT SELECTED — A NEW NOTION CHAT STARTS WITH THE NEXT MESSAGE"
+				? "AGENT SELECTED: " + String(agentName).toUpperCase() +
+					" — A NEW NOTION CHAT STARTS WITH THE NEXT MESSAGE"
 				: "BACK TO THE DEFAULT NOTION AI ASSISTANT");
 		};
 
@@ -208,8 +284,7 @@
 		link.onkeydown = (event) => {
 			if (event.key === "Enter") { event.preventDefault(); save(); }
 		};
-		name.onkeydown = link.onkeydown;
-		if (mode === "custom") link.focus();
+		void name;
 	};
 
 	Chat.prototype.setBusy = function (busy, label) {
